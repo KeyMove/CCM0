@@ -1,0 +1,1402 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>stdcc · Web Compiler IDE</title>
+<style>
+:root{
+  --bg:#1e1e1e; --bg2:#252526; --bg3:#2d2d30; --bg4:#333333;
+  --border:#3c3c3c; --border2:#454545;
+  --fg:#cccccc; --fg-dim:#858585; --fg-bright:#ffffff;
+  --accent:#007acc; --accent2:#0e639c;
+  --green:#89d185; --red:#f48771; --yellow:#dcdcaa; --blue:#569cd6;
+  --purple:#c586c0; --cyan:#4ec9b0; --orange:#ce9178;
+  --syntax-bg:#1e1e1e;
+  --tab-active-bg:#1e1e1e;
+  --btn-primary:#0e639c; --btn-primary-hover:#1177bb;
+  --btn-danger:#a1260d;
+}
+*{box-sizing:border-box; margin:0; padding:0;}
+html,body{height:100%;}
+body{
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", Roboto, Helvetica, Arial, sans-serif;
+  background:var(--bg); color:var(--fg); font-size:13px; overflow:hidden;
+  display:flex; flex-direction:column; height:100vh;
+}
+/* ======================= TOP TOOLBAR ======================= */
+.toolbar{
+  height:48px; flex:0 0 48px; background:var(--bg2); border-bottom:1px solid var(--border);
+  display:flex; align-items:center; padding:0 12px; gap:8px; user-select:none;
+}
+.brand{ display:flex; align-items:center; gap:8px; margin-right:8px; }
+.brand .logo{
+  width:26px; height:26px; border-radius:6px; background:linear-gradient(135deg,#007acc,#3fb9ff);
+  display:flex; align-items:center; justify-content:center; font-weight:700; color:#fff; font-size:13px;
+}
+.brand .title{ font-weight:600; color:var(--fg-bright); font-size:14px; letter-spacing:.3px; }
+.brand .sub{ font-size:11px; color:var(--fg-dim); }
+.spacer{ flex:1; }
+.tb-btn{
+  background:transparent; border:1px solid transparent; color:var(--fg); padding:5px 12px;
+  border-radius:4px; cursor:pointer; font-size:12.5px; display:inline-flex; align-items:center; gap:6px;
+  transition:background .15s;
+}
+.tb-btn:hover{ background:var(--bg4); }
+.tb-btn.primary{ background:var(--btn-primary); color:#fff; border-color:transparent; font-weight:500; }
+.tb-btn.primary:hover{ background:var(--btn-primary-hover); }
+.tb-btn .ico{ font-size:14px; }
+.tb-btn.green{ background:#0e6b3a; color:#fff; }
+.tb-btn.green:hover{ background:#119a53; }
+.tb-btn.danger{ background:transparent; color:var(--red); }
+.tb-btn.danger:hover{ background:var(--bg4); }
+.sep{ width:1px; height:22px; background:var(--border2); margin:0 4px; }
+
+/* ======================= MAIN LAYOUT ======================= */
+.main{ flex:1; display:flex; min-height:0; }
+/* left: activity bar */
+.activity{
+  width:48px; flex:0 0 48px; background:var(--bg); border-right:1px solid var(--border);
+  display:flex; flex-direction:column; align-items:center; padding-top:8px; gap:2px;
+}
+.act-ico{
+  width:40px; height:40px; display:flex; align-items:center; justify-content:center;
+  font-size:20px; color:var(--fg-dim); border-left:2px solid transparent; cursor:pointer; border-radius:4px;
+}
+.act-ico.active{ color:var(--fg-bright); border-left-color:var(--accent); background:var(--bg2); }
+.act-ico:hover{ color:var(--fg-bright); }
+/* file tree */
+.filepanel{
+  width:240px; flex:0 0 240px; background:var(--bg2); border-right:1px solid var(--border);
+  display:flex; flex-direction:column; min-height:0;
+}
+.file-header{
+  padding:10px 14px 6px; font-size:11px; text-transform:uppercase; letter-spacing:1px;
+  color:var(--fg-dim); display:flex; justify-content:space-between; align-items:center; user-select:none;
+}
+.file-actions{ display:flex; gap:2px; }
+.mini-btn{
+  background:transparent; border:none; color:var(--fg-dim); cursor:pointer; font-size:13px;
+  padding:2px 5px; border-radius:3px; line-height:1;
+}
+.mini-btn:hover{ background:var(--bg4); color:var(--fg); }
+.file-tree{ flex:1; overflow:auto; padding:4px 0 20px; }
+.tree-item{
+  display:flex; align-items:center; gap:6px; padding:3px 10px; cursor:pointer; white-space:nowrap;
+  font-size:13px; color:var(--fg); border-left:2px solid transparent;
+}
+.tree-item:hover{ background:var(--bg3); }
+.tree-item.selected{ background:var(--bg4); color:var(--fg-bright); }
+.tree-item.selected{ border-left-color:var(--accent); }
+.tree-item .caret{ width:12px; font-size:10px; color:var(--fg-dim); transition:transform .12s; flex:0 0 12px; text-align:center;}
+.tree-item .caret.open{ transform:rotate(90deg); }
+.tree-item .caret.leaf{ visibility:hidden; }
+.tree-item .t-ico{ font-size:14px; flex:0 0 18px; }
+.tree-item .t-name{ overflow:hidden; text-overflow:ellipsis; }
+.tree-item .t-name:focus{ outline:1px solid var(--accent); outline-offset:-1px; background:transparent; }
+.tree-item .c-src{ color:var(--blue); }
+.tree-item .c-hdr{ color:var(--purple); }
+.tree-item .c-other{ color:var(--yellow); }
+.tree-item .c-folder{ color:var(--accent); }
+.tree-children{ margin-left:12px; }
+/* editor */
+.editor-wrap{ flex:1; display:flex; flex-direction:column; min-width:0; background:var(--syntax-bg); }
+.editor-tabs{
+  height:34px; flex:0 0 34px; background:var(--bg2); border-bottom:1px solid var(--border);
+  display:flex; align-items:flex-end; overflow-x:auto; user-select:none;
+}
+.ed-tab{
+  height:33px; padding:0 12px; display:flex; align-items:center; gap:6px; border-right:1px solid var(--border);
+  background:var(--bg2); color:var(--fg-dim); cursor:pointer; font-size:12.5px; white-space:nowrap;
+  border-top:1px solid transparent;
+}
+.ed-tab.active{ background:var(--tab-active-bg); color:var(--fg-bright); border-top:1px solid var(--accent); }
+.ed-tab .close{ font-size:12px; opacity:0; border-radius:3px; padding:0 2px; }
+.ed-tab:hover .close{ opacity:.7; }
+.ed-tab .close:hover{ background:var(--bg4); opacity:1; }
+.editor-body{ flex:1; display:flex; min-height:0; }
+.editor-breadcrumb{
+  height:24px; flex:0 0 24px; background:var(--bg); border-bottom:1px solid var(--border);
+  display:flex; align-items:center; padding:0 12px; font-size:11px; color:var(--fg-dim); gap:4px; user-select:none;
+}
+.editor-breadcrumb .sep{ color:var(--fg-dim); margin:0; width:auto; border:none; }
+.editor-breadcrumb .bc-item{ cursor:default; }
+.editor-breadcrumb .bc-folder{ color:var(--accent); }
+.editor-container{ flex:1; position:relative; overflow:auto; background:var(--syntax-bg); }
+#editorTextarea{
+  position:absolute; inset:0; width:100%; height:100%; border:none; outline:none; resize:none;
+  background:transparent; color:transparent; caret-color:var(--fg-bright);
+  font-family:'JetBrains Mono','Cascadia Code',Consolas,Menlo,monospace; font-size:13px; line-height:20px;
+  padding:10px 14px; tab-size:4; white-space:pre; overflow:auto;
+}
+#editorHighlight{
+  position:absolute; inset:0; padding:10px 14px; pointer-events:none; overflow:hidden;
+  font-family:'JetBrains Mono','Cascadia Code',Consolas,Menlo,monospace; font-size:13px; line-height:20px;
+  white-space:pre; word-wrap:break-word; color:var(--fg); tab-size:4;
+}
+.editor-linebar{
+  flex:0 0 46px; background:var(--bg2); border-right:1px solid var(--border); overflow:hidden;
+  font-family:monospace; font-size:12px; line-height:20px; padding:10px 8px 0; text-align:right; color:var(--fg-dim);
+}
+/* right output panels */
+.outpanel{
+  width:360px; flex:0 0 360px; background:var(--bg); border-left:1px solid var(--border);
+  display:flex; flex-direction:column; min-height:0;
+}
+.out-tabs{ height:34px; flex:0 0 34px; display:flex; background:var(--bg2); border-bottom:1px solid var(--border); user-select:none; }
+.out-tab{
+  flex:1; padding:0 10px; display:flex; align-items:center; justify-content:center; gap:6px;
+  color:var(--fg-dim); cursor:pointer; font-size:12.5px; border-bottom:2px solid transparent;
+}
+.out-tab.active{ color:var(--fg-bright); border-bottom-color:var(--accent); background:var(--bg); }
+.out-body{ flex:1; overflow:auto; font-family:'JetBrains Mono','Cascadia Code',Consolas,monospace; font-size:12px; line-height:1.6; padding:8px 10px; }
+.out-body pre{ white-space:pre-wrap; word-wrap:break-word; font:inherit; color:var(--fg); }
+.out-body .log-line{ margin-bottom:1px; }
+.out-body .log-ok{ color:var(--green); }
+.out-body .log-err{ color:var(--red); }
+.out-body .log-info{ color:var(--cyan); }
+.out-body .log-warn{ color:var(--yellow); }
+.out-empty{ color:var(--fg-dim); font-style:italic; }
+.hex-head{ color:var(--fg-dim); }
+.hex-addr{ color:var(--purple); }
+.hex-data{ color:var(--green); }
+.hex-ascii{ color:var(--cyan); }
+.asm-line{ white-space:pre; }
+.asm-src{ color:var(--fg-dim); font-style:italic; }
+.asm-op{ color:var(--blue); }
+.asm-reg{ color:var(--yellow); }
+.asm-imm{ color:var(--orange); }
+.asm-label{ color:var(--cyan); }
+/* status bar */
+.statusbar{
+  height:24px; flex:0 0 24px; background:var(--accent); color:#fff; font-size:11.5px;
+  display:flex; align-items:center; padding:0 10px; gap:16px; user-select:none;
+}
+.statusbar .item{ display:flex; align-items:center; gap:4px; }
+.statusbar .spacer{ flex:1; }
+.statusbar .link{ cursor:pointer; }
+.statusbar .link:hover{ text-decoration:underline; }
+
+/* ======================= MODAL ======================= */
+.modal-mask{
+  position:fixed; inset:0; background:rgba(0,0,0,.55); display:none; align-items:center; justify-content:center; z-index:100;
+}
+.modal-mask.show{ display:flex; }
+.modal{
+  background:var(--bg3); border:1px solid var(--border2); border-radius:8px; width:480px; max-width:94vw;
+  box-shadow:0 12px 40px rgba(0,0,0,.5); overflow:hidden;
+}
+.modal-head{
+  padding:14px 18px; border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between;
+}
+.modal-head h3{ font-size:14px; color:var(--fg-bright); font-weight:600; }
+.modal-close{ background:none; border:none; color:var(--fg-dim); font-size:18px; cursor:pointer; line-height:1; }
+.modal-close:hover{ color:var(--fg-bright); }
+.modal-body{ padding:16px 18px; max-height:60vh; overflow:auto; }
+.field{ margin-bottom:14px; }
+.field label{ display:block; font-size:11px; color:var(--fg-dim); margin-bottom:5px; text-transform:uppercase; letter-spacing:.5px; }
+.field input, .field select{
+  width:100%; background:var(--bg); border:1px solid var(--border2); color:var(--fg);
+  padding:7px 10px; border-radius:4px; font-size:13px; font-family:monospace; outline:none;
+}
+.field input:focus, .field select:focus{ border-color:var(--accent); }
+.field .hint{ font-size:11px; color:var(--fg-dim); margin-top:4px; }
+.field-row{ display:flex; gap:12px; }
+.field-row .field{ flex:1; }
+.check{ display:flex; align-items:center; gap:8px; font-size:13px; color:var(--fg); cursor:pointer; margin-bottom:10px; user-select:none;}
+.check input{ width:auto; accent-color:var(--accent); }
+.modal-foot{ padding:12px 18px; border-top:1px solid var(--border); display:flex; justify-content:flex-end; gap:8px; background:var(--bg2);}
+.btn{ border:none; border-radius:4px; padding:7px 16px; font-size:13px; cursor:pointer; }
+.btn.primary{ background:var(--btn-primary); color:#fff; }
+.btn.primary:hover{ background:var(--btn-primary-hover); }
+.btn.ghost{ background:var(--bg4); color:var(--fg); }
+.btn.ghost:hover{ background:var(--border2); }
+
+/* context menu */
+.ctx-menu{
+  position:fixed; background:var(--bg3); border:1px solid var(--border2); border-radius:6px; min-width:160px;
+  box-shadow:0 6px 24px rgba(0,0,0,.5); z-index:200; display:none; padding:4px; font-size:13px;
+}
+.ctx-menu.show{ display:block; }
+.ctx-item{ padding:6px 12px; border-radius:4px; cursor:pointer; display:flex; align-items:center; gap:8px; }
+.ctx-item:hover{ background:var(--accent); color:#fff; }
+.ctx-item.danger{ color:var(--red); }
+.ctx-item.danger:hover{ background:var(--btn-danger); color:#fff; }
+.ctx-sep{ height:1px; background:var(--border2); margin:4px 6px; }
+
+/* scrollbars */
+::-webkit-scrollbar{ width:10px; height:10px; }
+::-webkit-scrollbar-thumb{ background:var(--border2); border-radius:5px; }
+::-webkit-scrollbar-thumb:hover{ background:#4d4d4d; }
+::-webkit-scrollbar-track{ background:transparent; }
+</style>
+</head>
+<body>
+
+<!-- ==================== TOOLBAR ==================== -->
+<div class="toolbar">
+  <div class="brand">
+    <div class="logo">s</div>
+    <div>
+      <div class="title">stdcc IDE</div>
+      <div class="sub">C11 → ARM Thumb-1</div>
+    </div>
+  </div>
+  <button class="tb-btn" id="btnOpenFolder" title="打开文件夹 (Open Folder)">
+    <span class="ico">📂</span> 打开文件夹
+  </button>
+  <button class="tb-btn" id="btnNewFile" title="新建文件">
+    <span class="ico">📄</span> 新建
+  </button>
+  <button class="tb-btn" id="btnNewFolder" title="新建文件夹">
+    <span class="ico">📁</span> 新建文件夹
+  </button>
+  <div class="spacer"></div>
+  <button class="tb-btn" id="btnMemSettings" title="内存 / 编译设置">
+    <span class="ico">⚙️</span> 内存设置
+  </button>
+  <div class="sep"></div>
+  <button class="tb-btn green" id="btnCompile" title="编译当前项目 (Ctrl+Enter)">
+    <span class="ico">▶</span> 编译
+  </button>
+  <button class="tb-btn primary" id="btnDownloadBin" title="下载编译产物 .bin" disabled>
+    <span class="ico">⬇</span> 下载 .bin
+  </button>
+  <button class="tb-btn primary" id="btnDownloadHex" title="下载 HEX 固件" disabled>
+    <span class="ico">⬇</span> HEX
+  </button>
+  <input type="file" id="folderInput" webkitdirectory directory multiple style="display:none">
+</div>
+
+<!-- ==================== MAIN ==================== -->
+<div class="main">
+  <div class="activity">
+    <div class="act-ico active" title="资源管理器">📁</div>
+    <div class="act-ico" title="搜索" style="opacity:.4">🔍</div>
+    <div class="act-ico" title="源代码管理" style="opacity:.4">⛁</div>
+    <div class="act-ico" title="运行" style="opacity:.4">▶</div>
+  </div>
+
+  <!-- FILE TREE -->
+  <div class="filepanel">
+    <div class="file-header">
+      <span>资源管理器</span>
+      <div class="file-actions">
+        <button class="mini-btn" id="mNewFile" title="新建文件">📄</button>
+        <button class="mini-btn" id="mNewFolder" title="新建文件夹">📁</button>
+        <button class="mini-btn" id="mUpload" title="上传文件">⬆</button>
+        <button class="mini-btn" id="mRefresh" title="刷新">⟳</button>
+      </div>
+    </div>
+    <div class="file-tree" id="fileTree"></div>
+    <input type="file" id="fileUpload" multiple style="display:none">
+  </div>
+
+  <!-- EDITOR -->
+  <div class="editor-wrap">
+    <div class="editor-tabs" id="editorTabs"></div>
+    <div class="editor-breadcrumb" id="breadcrumb"></div>
+    <div class="editor-body">
+      <div class="editor-linebar" id="linebar">1</div>
+      <div class="editor-container">
+        <div id="editorHighlight"></div>
+        <textarea id="editorTextarea" spellcheck="false" wrap="off" placeholder="// 打开或新建一个 C 文件开始编写..."></textarea>
+      </div>
+    </div>
+  </div>
+
+  <!-- OUTPUT PANELS -->
+  <div class="outpanel">
+    <div class="out-tabs">
+      <div class="out-tab active" data-tab="output"><span>🖥</span> 编译输出</div>
+      <div class="out-tab" data-tab="hex"><span>⬡</span> HEX 预览</div>
+      <div class="out-tab" data-tab="asm"><span>⇄</span> C·汇编对照</div>
+    </div>
+    <div class="out-body" id="outBody"></div>
+  </div>
+</div>
+
+<!-- ==================== STATUS BAR ==================== -->
+<div class="statusbar">
+  <div class="item" id="sbLang">🟦 C (C11)</div>
+  <div class="item" id="sbTarget">🎯 ARM Cortex-M0 · Thumb-1</div>
+  <div class="item" id="sbOptimize">⚡ -O2</div>
+  <div class="spacer"></div>
+  <div class="item" id="sbStatus">就绪</div>
+  <div class="item link" id="sbBranch">stdcc v1.0.0</div>
+</div>
+
+<!-- ==================== MEMORY SETTINGS MODAL ==================== -->
+<div class="modal-mask" id="settingsMask">
+  <div class="modal">
+    <div class="modal-head">
+      <h3>⚙️ 内存 & 编译设置</h3>
+      <button class="modal-close" id="settingsClose">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field-row">
+        <div class="field">
+          <label>Flash 起始地址</label>
+          <input id="setFlash" value="0x08000000" spellcheck="false">
+          <div class="hint">代码/只读数据段基址</div>
+        </div>
+        <div class="field">
+          <label>RAM 起始地址</label>
+          <input id="setRam" value="0x20000000" spellcheck="false">
+          <div class="hint">数据段基址</div>
+        </div>
+      </div>
+      <div class="field">
+        <label>RAM 大小（决定启动栈顶 SP）</label>
+        <input id="setRamSize" value="0x8000" spellcheck="false">
+        <div class="hint">需盖住全局数组；仅 --startup 时使用</div>
+      </div>
+      <div class="field">
+        <label>优化级别</label>
+        <select id="setOpt">
+          <option value="0">O0 — 无优化（便于调试）</option>
+          <option value="1">O1 — 基础优化</option>
+          <option value="2" selected>O2 — 推荐（默认）</option>
+          <option value="3">O3 — 激进</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>中文字符串编码</label>
+        <select id="setEncoding">
+          <option value="utf8" selected>UTF-8（默认）</option>
+          <option value="gb2312">GB2312（Keil 兼容）</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>入口 / 启动方式</label>
+        <select id="setStartup">
+          <option value="0">轻量启动桩（BL main → 死循环）</option>
+          <option value="1" selected>标准启动 ROM 镜像（向量表 + init 搬运 + bss 清空）</option>
+        </select>
+      </div>
+      <label class="check"><input type="checkbox" id="setSrcAsm" checked> C↔汇编对照模式（汇编中插入 C 源码行注释）</label>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" id="settingsCancel">取消</button>
+      <button class="btn primary" id="settingsOk">应用设置</button>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== CONTEXT MENU ==================== -->
+<div class="ctx-menu" id="ctxMenu">
+  <div class="ctx-item" data-act="open">📂 打开</div>
+  <div class="ctx-item" data-act="newfile">📄 新建文件</div>
+  <div class="ctx-item" data-act="newfolder">📁 新建文件夹</div>
+  <div class="ctx-item" data-act="rename">✏️ 重命名</div>
+  <div class="ctx-item" data-act="upload">⬆ 上传文件到此处</div>
+  <div class="ctx-sep"></div>
+  <div class="ctx-item danger" data-act="delete">🗑 删除</div>
+</div>
+
+<script src="webide_stdcc.js"></script>
+<script>
+'use strict';
+/* ================================================================
+ * stdcc Web Compiler IDE
+ * 文件树(可打开文件夹) + 编辑器 + 右 tab(编译输出/HEX预览/C汇编对照)
+ * 顶部内存设置(模态) + 编译 + 下载bin
+ * ================================================================ */
+const $ = (id) => document.getElementById(id);
+
+/* ---------- 虚拟文件系统 (供编译器 #include 使用) ---------- */
+const VFS = {
+  files: {},          // path -> { name, content, isDir, children? }
+  // 根节点
+  root: null,
+  // 编译器 fs shim 需要的方法
+  readFile(p){
+    const f = VFS.files[p];
+    if (f && !f.isDir) return f.content;
+    return null;
+  },
+  exists(p){
+    return !!VFS.files[p];
+  },
+  writeFile(){}
+};
+
+/* ---------- 项目文件模型 ---------- */
+const Project = {
+  root: null,           // tree node
+  openEditors: [],      // [{path, dirty}]
+  activePath: null,
+  mainFile: null,       // 编译入口
+  nodes: {},            // path -> node
+  idc: 0,
+};
+
+function newFileNode(name, content){
+  return { id:'n'+(++Project.idc), name, content: content||'', isDir:false, children:null };
+}
+function newDirNode(name){
+  return { id:'n'+(++Project.idc), name, isDir:true, children:[] };
+}
+
+/* ---------- 初始示例项目 ---------- */
+function initProject(){
+  Project.root = newDirNode('项目');
+  Project.nodes = {};
+  Project.root.children = [
+    { id:'n'+(++Project.idc), name:'main.c', isDir:false, content:`/* stdcc 示例 — 斐波那契 + 数组求和 */
+#include <stdio.h>
+#include <stdint.h>
+
+#define N 10
+
+// 计算第 n 项斐波那契数（递归）
+int fib(int n) {
+    if (n <= 1) return n;
+    return fib(n - 1) + fib(n - 2);
+}
+
+// 数组求和
+int sum_array(const int arr[], int len) {
+    int s = 0;
+    for (int i = 0; i < len; i++) {
+        s += arr[i];
+    }
+    return s;
+}
+
+int main(void) {
+    int seq[N];
+    // 填充斐波那契数列
+    for (int i = 0; i < N; i++) {
+        seq[i] = fib(i);
+    }
+    // 打印
+    for (int i = 0; i < N; i++) {
+        printf("fib(%d) = %d\\n", i, seq[i]);
+    }
+    printf("sum = %d\\n", sum_array(seq, N));
+    return seq[N-1];
+}
+` },
+    { id:'n'+(++Project.idc), name:'led.c', isDir:false, content:`/* 简单硬件抽象示例：模拟 GPIO 控制 */
+#include <stdint.h>
+
+#define GPIO_BASE  0x40000000
+#define GPIO_OUT   (*(volatile uint32_t*)(GPIO_BASE + 0x00))
+
+/* 打开 LED 数组的字节模式 */
+void led_pattern(uint8_t pattern) {
+    GPIO_OUT = pattern;
+}
+
+/* 8 位 LED 流水灯一个周期 */
+void led_wave(uint32_t steps) {
+    uint32_t i;
+    uint8_t v = 0x01;
+    for (i = 0; i < steps; i++) {
+        led_pattern(v);
+        v = (v << 1) | (v >> 7);   // 循环左移
+    }
+}
+` },
+    { id:'n'+(++Project.idc), name:'utils.h', isDir:false, content:`#ifndef UTILS_H
+#define UTILS_H
+
+/* 求两数较大值 */
+int max(int a, int b);
+
+/* 求两数较小值 */
+int min(int a, int b);
+
+/* 交换两个整数 */
+void swap(int *a, int *b);
+
+#endif /* UTILS_H */
+` },
+    { id:'n'+(++Project.idc), name:'utils.c', isDir:false, content:`#include "utils.h"
+
+int max(int a, int b) { return (a > b) ? a : b; }
+int min(int a, int b) { return (a < b) ? a : b; }
+void swap(int *a, int *b) {
+    int t = *a;
+    *a = *b;
+    *b = t;
+}
+` },
+    { id:'n'+(++Project.idc), name:'README.md', isDir:false, content:`# stdcc Web IDE 示例项目
+
+这是一个演示多文件项目结构的示例。
+
+- **main.c** — 编译入口（含 main 函数）
+- **utils.h / utils.c** — 头文件 + 实现
+- **led.c** — 硬件抽象示例
+
+点击顶部 **▶ 编译** 按钮，可在右侧查看编译输出、HEX 固件与 C↔汇编对照。
+
+你也可以通过 **📂 打开文件夹** 上传本地 C 项目到浏览器中进行编译。
+` },
+  ];
+  indexNodes();
+  Project.mainFile = '项目/main.c';
+  indexVFS();
+}
+
+function indexNodes(){
+  Project.nodes = {};
+  (function walk(node, parentPath){
+    const path = parentPath ? parentPath + '/' + node.name : node.name;
+    node.path = path;
+    Project.nodes[path] = node;
+    if (node.isDir && node.children){
+      for (const c of node.children) walk(c, path);
+    }
+  })(Project.root, '');
+}
+
+function indexVFS(){
+  VFS.files = {};
+  // 内置头文件（浏览器内嵌，模拟 include/ 目录）
+  addVFS('include/stdint.h', INCLUDE_STDINT);
+  addVFS('include/stdio.h', INCLUDE_STDIO);
+  addVFS('include/stddef.h', INCLUDE_STDDEF);
+  addVFS('include/math.h', INCLUDE_MATH);
+  addVFS('include/string.h', INCLUDE_STRING);
+  (function walk(node, parentPath){
+    const path = parentPath ? parentPath + '/' + node.name : node.name;
+    VFS.files[path] = node;
+    if (node.isDir && node.children){
+      for (const c of node.children) walk(c, path);
+    }
+  })(Project.root, '');
+}
+
+function addVFS(path, content){
+  VFS.files[path] = { name: path.split('/').pop(), isDir:false, content };
+}
+
+/* 内置头文件内容（与仓库 include/ 一致） */
+const INCLUDE_STDINT = `#ifndef __STDINT_H
+#define __STDINT_H
+typedef signed char int8_t;
+typedef unsigned char uint8_t;
+typedef short int16_t;
+typedef unsigned short uint16_t;
+typedef int int32_t;
+typedef unsigned int uint32_t;
+typedef long long int64_t;
+typedef unsigned long long uint64_t;
+typedef signed char int_least8_t;
+typedef unsigned char uint_least8_t;
+typedef short int_least16_t;
+typedef unsigned short uint_least16_t;
+typedef int int_least32_t;
+typedef unsigned int uint_least32_t;
+typedef int intptr_t;
+typedef unsigned int uintptr_t;
+typedef int size_t;
+#define INT8_MIN (-128)
+#define INT8_MAX 127
+#define UINT8_MAX 255
+#define INT16_MIN (-32768)
+#define INT16_MAX 32767
+#define UINT16_MAX 65535
+#define INT32_MIN (-2147483648)
+#define INT32_MAX 2147483647
+#define UINT32_MAX 4294967295UL
+#endif
+`;
+const INCLUDE_STDIO = `#ifndef __STDIO_H
+#define __STDIO_H
+int printf(const char *fmt, ...);
+int sprintf(char *buf, const char *fmt, ...);
+int snprintf(char *buf, unsigned int n, const char *fmt, ...);
+#endif
+`;
+const INCLUDE_STDDEF = `#ifndef __STDDEF_H
+#define __STDDEF_H
+#define NULL ((void*)0)
+typedef unsigned int size_t;
+typedef int ptrdiff_t;
+#define offsetof(type, member) ((size_t)&(((type*)0)->member))
+#endif
+`;
+const INCLUDE_MATH = `#ifndef __MATH_H
+#define __MATH_H
+double fabs(double x);
+double sqrt(double x);
+double sin(double x);
+double cos(double x);
+double pow(double x, double y);
+double floor(double x);
+double ceil(double x);
+#endif
+`;
+const INCLUDE_STRING = `#ifndef __STRING_H
+#define __STRING_H
+#include <stddef.h>
+void *memcpy(void *dest, const void *src, size_t n);
+void *memset(void *s, int c, size_t n);
+int memcmp(const void *a, const void *b, size_t n);
+int strlen(const char *s);
+char *strcpy(char *dest, const char *src);
+#endif
+`;
+
+/* ================================================================
+ * 文件树渲染
+ * ================================================================ */
+let selectedTreePath = null;
+let ctxTarget = null;
+
+function renderTree(){
+  const tree = $('fileTree');
+  tree.innerHTML = '';
+  tree.appendChild(renderNode(Project.root, 0, true));
+}
+
+function renderNode(node, depth, isRoot){
+  const wrap = document.createElement('div');
+  wrap.className = 'tree-node';
+  if (isRoot){
+    // 根节点常显
+    const rootItem = document.createElement('div');
+    rootItem.className = 'tree-item selected-folder';
+    rootItem.style.paddingLeft = (8 + depth*0)+'px';
+    rootItem.style.fontWeight = '600';
+    rootItem.innerHTML = `<span class="caret open">▶</span><span class="t-ico c-folder">📁</span><span class="t-name">${esc(node.name)}</span>`;
+    rootItem.dataset.path = node.path;
+    rootItem.addEventListener('click', (e)=>{ e.stopPropagation(); toggleDir(node, rootItem); });
+    rootItem.addEventListener('contextmenu', (e)=>{ e.preventDefault(); showCtx(e, node); });
+    wrap.appendChild(rootItem);
+    if (node._open !== false){
+      const kids = document.createElement('div');
+      kids.className = 'tree-children';
+      for (const c of node.children) kids.appendChild(renderNode(c, depth+1, false));
+      wrap.appendChild(kids);
+    }
+    return wrap;
+  }
+  const item = document.createElement('div');
+  item.className = 'tree-item' + (node.path === selectedTreePath ? ' selected':'');
+  const pad = 8 + depth*0;
+  item.style.paddingLeft = (pad+8)+'px';
+  if (node.isDir){
+    const open = node._open !== false;
+    item.innerHTML = `<span class="caret ${open?'open':'leaf'}">▶</span><span class="t-ico c-folder">${open?'📂':'📁'}</span><span class="t-name">${esc(node.name)}</span>`;
+    item.dataset.path = node.path;
+    item.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      selectedTreePath = node.path;
+      toggleDir(node, item);
+      renderTree();
+    });
+    item.addEventListener('contextmenu', (e)=>{ e.preventDefault(); showCtx(e, node); });
+  } else {
+    const cls = node.name.endsWith('.c')||node.name.endsWith('.h') ? (node.name.endsWith('.h')?'c-hdr':'c-src') : 'c-other';
+    item.innerHTML = `<span class="caret leaf">▶</span><span class="t-ico ${cls}">${fileIcon(node.name)}</span><span class="t-name">${esc(node.name)}</span>`;
+    item.dataset.path = node.path;
+    item.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      openFile(node);
+      selectedTreePath = node.path;
+      renderTree();
+    });
+    item.addEventListener('contextmenu', (e)=>{ e.preventDefault(); showCtx(e, node); });
+  }
+  wrap.appendChild(item);
+  if (node.isDir && node._open !== false && node.children && node.children.length){
+    const kids = document.createElement('div');
+    kids.className = 'tree-children';
+    for (const c of node.children) kids.appendChild(renderNode(c, depth+1, false));
+    wrap.appendChild(kids);
+  }
+  return wrap;
+}
+
+function toggleDir(node, item){
+  node._open = node._open === false ? true : false;
+  renderTree();
+}
+
+function fileIcon(name){
+  if (name.endsWith('.c')) return '📄';
+  if (name.endsWith('.h')) return '🧩';
+  if (name.endsWith('.md')) return '📘';
+  if (name.endsWith('.txt')) return '📃';
+  if (name.endsWith('.json')) return '📦';
+  return '📄';
+}
+
+/* ---------- 右键菜单 ---------- */
+function showCtx(e, node){
+  ctxTarget = node;
+  const m = $('ctxMenu');
+  m.style.left = e.clientX+'px';
+  m.style.top = e.clientY+'px';
+  m.classList.add('show');
+  e.stopPropagation();
+}
+document.addEventListener('click', (e)=>{
+  if (!$('ctxMenu').contains(e.target)) $('ctxMenu').classList.remove('show');
+});
+$('ctxMenu').addEventListener('click', (e)=>{
+  const item = e.target.closest('.ctx-item');
+  if (!item) return;
+  const act = item.dataset.act;
+  const node = ctxTarget;
+  $('ctxMenu').classList.remove('show');
+  if (!node) return;
+  const isDir = node.isDir;
+  const parentPath = node.path.substring(0, node.path.lastIndexOf('/'));
+  switch(act){
+    case 'open': if (!isDir) openFile(node); break;
+    case 'newfile': createFile(isDir ? node.path : parentPath); break;
+    case 'newfolder': createFolder(isDir ? node.path : parentPath); break;
+    case 'rename': renameNode(node); break;
+    case 'upload': uploadTo(isDir ? node.path : parentPath); break;
+    case 'delete': deleteNode(node); break;
+  }
+});
+
+/* ---------- 文件操作 ---------- */
+function getDirNode(path){
+  return Project.nodes[path];
+}
+function findParentAndIndex(node){
+  const parentPath = node.path.substring(0, node.path.lastIndexOf('/'));
+  const parent = getDirNode(parentPath);
+  if (!parent) return null;
+  return { parent, idx: parent.children.indexOf(node) };
+}
+
+function createFile(dirPath){
+  const name = prompt('新建文件名（如 test.c）:');
+  if (!name || !name.trim()) return;
+  const clean = name.trim();
+  if (clean.includes('/')){
+    alert('文件名不能包含路径分隔符');
+    return;
+  }
+  const dir = getDirNode(dirPath) || Project.root;
+  if (dir.children.some(c=>c.name===clean)){ alert('已存在同名文件'); return; }
+  const node = newFileNode(clean, '');
+  dir.children.push(node);
+  indexNodes(); indexVFS();
+  renderTree();
+  openFile(node);
+}
+function createFolder(dirPath){
+  const name = prompt('新建文件夹名:');
+  if (!name || !name.trim()) return;
+  const clean = name.trim();
+  if (clean.includes('/')){ alert('文件夹名不能包含路径分隔符'); return; }
+  const dir = getDirNode(dirPath) || Project.root;
+  if (dir.children.some(c=>c.name===clean)){ alert('已存在同名文件夹'); return; }
+  dir.children.push(newDirNode(clean));
+  indexNodes(); indexVFS();
+  renderTree();
+}
+function renameNode(node){
+  const name = prompt('重命名为:', node.name);
+  if (!name || !name.trim() || name === node.name) return;
+  const clean = name.trim();
+  if (clean.includes('/')){ alert('名称不能包含路径分隔符'); return; }
+  const fi = findParentAndIndex(node);
+  if (!fi) return;
+  if (fi.parent.children.some(c=>c!==node && c.name===clean)){ alert('已存在同名'); return; }
+  const oldPath = node.path;
+  fi.parent.children[fi.idx].name = clean;
+  indexNodes(); indexVFS();
+  // 更新打开的编辑器路径
+  Project.openEditors.forEach(ed=>{
+    if (ed.path === oldPath) ed.path = node.path;
+  });
+  if (Project.activePath === oldPath) Project.activePath = node.path;
+  if (Project.mainFile === oldPath) Project.mainFile = node.path;
+  renderTree(); renderTabs(); renderEditor();
+}
+function deleteNode(node){
+  const msg = node.isDir ? `确定删除文件夹「${node.name}」及其内容？` : `确定删除文件「${node.name}」？`;
+  if (!confirm(msg)) return;
+  const fi = findParentAndIndex(node);
+  if (!fi) return;
+  fi.parent.children.splice(fi.idx, 1);
+  // 关闭该文件相关的编辑器
+  const affected = [];
+  Object.values(Project.nodes).forEach(n=>{
+    if (n.path === node.path || (n.path.startsWith(node.path + '/'))) affected.push(n.path);
+  });
+  Project.openEditors = Project.openEditors.filter(ed=>!affected.includes(ed.path));
+  if (affected.includes(Project.activePath)) Project.activePath = null;
+  if (affected.includes(Project.mainFile)) Project.mainFile = null;
+  indexNodes(); indexVFS();
+  renderTree(); renderTabs(); renderEditor();
+}
+function uploadTo(dirPath){
+  $('fileUpload').dataset.dir = dirPath;
+  $('fileUpload').click();
+}
+$('fileUpload').addEventListener('change', (e)=>{
+  const dirPath = e.target.dataset.dir || '项目';
+  const dir = getDirNode(dirPath) || Project.root;
+  for (const f of e.target.files){
+    const name = f.name;
+    if (dir.children.some(c=>c.name===name)) continue;
+    const reader = new FileReader();
+    reader.onload = ()=> {
+      dir.children.push(newFileNode(name, reader.result));
+      indexNodes(); indexVFS(); renderTree();
+    };
+    reader.readAsText(f);
+  }
+  e.target.value = '';
+});
+
+/* 打开文件夹（webkitdirectory 多文件上传，重建文件树） */
+$('folderInput').addEventListener('change', (e)=>{
+  const files = Array.from(e.target.files);
+  if (!files.length) return;
+  // 构建完整目录树
+  const newRoot = newDirNode('项目');
+  const map = { '': newRoot };
+  const used = {};
+  files.forEach(f => {
+    const rel = f.webkitRelativePath || f.name;
+    const parts = rel.split('/');
+    parts.shift(); // 去掉根文件夹名
+    if (parts.length < 1) return;
+    let cur = '';
+    for (let i=0;i<parts.length-1;i++){
+      cur = cur ? cur + '/' + parts[i] : parts[i];
+      if (!map[cur]){
+        const nd = newDirNode(parts[i]);
+        map[cur] = nd;
+        const p = cur.substring(0, cur.lastIndexOf('/'));
+        map[p].children.push(nd);
+      }
+    }
+    const fname = parts[parts.length-1];
+    const full = cur ? cur + '/' + fname : fname;
+    const node = newFileNode(fname, '');
+    node._file = f;
+    map[full] = node;
+    map[cur].children.push(node);
+  });
+  Project.root = newRoot;
+  indexNodes();
+  // 异步读取所有文件内容
+  readAllFiles(files, () => {
+    indexVFS();
+    // 选择入口
+    const cMain = findCFile();
+    if (cMain){ Project.mainFile = cMain.path; openFile(cMain); }
+    renderTree(); renderTabs(); renderEditor();
+    addLog('已打开文件夹：共 ' + files.length + ' 个文件', 'ok');
+  });
+  e.target.value = '';
+});
+
+function findCFile(){
+  let best = null;
+  (function walk(node){
+    if (node.isDir && node.children){ for (const c of node.children) walk(c); return; }
+    if (node.name === 'main.c'){ if(!best) best=node; }
+    else if (node.name.endsWith('.c') && !best) best = node;
+  })(Project.root);
+  return best;
+}
+function readAllFiles(files, cb){
+  let pending = 0;
+  files.forEach(f=>{
+    const rel = f.webkitRelativePath || f.name;
+    const parts = rel.split('/'); parts.shift();
+    const path = parts.join('/');
+    const node = Project.nodes[path];
+    if (!node || node.isDir) return;
+    pending++;
+    const reader = new FileReader();
+    reader.onload = ()=>{ node.content = reader.result || ''; node._file=null; if(--pending===0) cb(); };
+    reader.onerror = ()=>{ node.content=''; node._file=null; if(--pending===0) cb(); };
+    reader.readAsText(f);
+  });
+  if (pending===0) cb();
+}
+
+/* ================================================================
+ * 编辑器
+ * ================================================================ */
+function openFile(node){
+  if (!Project.openEditors.some(ed=>ed.path===node.path)){
+    Project.openEditors.push({ path: node.path, dirty:false });
+  }
+  Project.activePath = node.path;
+  renderTabs(); renderEditor(); renderTree();
+}
+function closeFile(path){
+  const idx = Project.openEditors.findIndex(ed=>ed.path===path);
+  if (idx<0) return;
+  Project.openEditors.splice(idx,1);
+  if (Project.activePath === path){
+    const prev = Project.openEditors[idx-1] || Project.openEditors[idx];
+    Project.activePath = prev ? prev.path : null;
+  }
+  renderTabs(); renderEditor();
+}
+function renderTabs(){
+  const tabs = $('editorTabs');
+  tabs.innerHTML = '';
+  Project.openEditors.forEach(ed=>{
+    const node = Project.nodes[ed.path];
+    if (!node) return;
+    const t = document.createElement('div');
+    t.className = 'ed-tab' + (ed.path===Project.activePath?' active':'');
+    t.innerHTML = `${fileIcon(node.name)} <span>${esc(node.name)}</span><span class="close" data-close="${ed.path}">✕</span>`;
+    t.addEventListener('click', (e)=>{
+      if (e.target.classList.contains('close')){
+        closeFile(ed.path);
+      } else {
+        Project.activePath = ed.path;
+        renderTabs(); renderEditor(); renderTree();
+      }
+    });
+    tabs.appendChild(t);
+  });
+  if (!Project.activePath && Project.openEditors.length) {
+    Project.activePath = Project.openEditors[0].path;
+  }
+}
+function renderEditor(){
+  const node = Project.activePath ? Project.nodes[Project.activePath] : null;
+  const ta = $('editorTextarea');
+  const hl = $('editorHighlight');
+  const bc = $('breadcrumb');
+  const lb = $('linebar');
+  if (!node){
+    ta.value = '';
+    hl.innerHTML = '';
+    bc.innerHTML = '<span>—</span>';
+    lb.innerHTML = '1';
+    ta.placeholder = '// 打开或新建一个 C 文件开始编写...';
+    return;
+  }
+  ta.value = node.content;
+  ta.placeholder = '';
+  highlight(node.content, hl);
+  // 面包屑
+  const parts = node.path.split('/');
+  bc.innerHTML = parts.map((p,i)=>
+    i<parts.length-1 ? `<span class="bc-folder">${esc(p)}</span><span class="sep">/</span>` : `<span>${esc(p)}</span>`
+  ).join('');
+  updateLinebar();
+  // 语法高亮文件类型标记
+  const isC = node.name.endsWith('.c');
+  $('sbLang').textContent = isC ? '🟦 C (C11)' : (node.name.endsWith('.h')?'🧩 C Header':'📄 '+ext(node.name));
+}
+function ext(name){
+  const i = name.lastIndexOf('.');
+  return i<0 ? '—' : name.slice(i+1).toUpperCase();
+}
+
+$('editorTextarea').addEventListener('input', ()=>{
+  const node = Project.activePath ? Project.nodes[Project.activePath] : null;
+  if (!node) return;
+  node.content = $('editorTextarea').value;
+  const ed = Project.openEditors.find(e=>e.path===node.path);
+  if (ed) ed.dirty = true;
+  highlight(node.content, $('editorHighlight'));
+  updateLinebar();
+});
+$('editorTextarea').addEventListener('scroll', ()=>{
+  $('editorHighlight').scrollTop = $('editorTextarea').scrollTop;
+  $('editorHighlight').scrollLeft = $('editorTextarea').scrollLeft;
+});
+function updateLinebar(){
+  const n = $('editorTextarea').value.split('\n').length;
+  let s='';
+  for(let i=1;i<=n;i++) s+=i+'\n';
+  $('linebar').textContent = s.slice(0,-1);
+}
+
+/* ---------- 语法高亮 ---------- */
+function highlight(code, el){
+  const escCode = esc(code);
+  const tokens = tokenize(code);
+  let html = '', pos = 0;
+  for (const t of tokens){
+    if (t.start > pos) html += esc(code.slice(pos, t.start));
+    html += `<span class="${t.cls}">${esc(t.text)}</span>`;
+    pos = t.end;
+  }
+  if (pos < code.length) html += esc(code.slice(pos));
+  el.innerHTML = html;
+}
+const C_KEYWORDS = new Set(['auto','break','case','char','const','continue','default','do','double','else','enum','extern','float','for','goto','if','inline','int','long','register','restrict','return','short','signed','sizeof','static','struct','switch','typedef','union','unsigned','void','volatile','while','weak','interrupt','_Bool','bool']);
+const C_TYPES = new Set(['int8_t','uint8_t','int16_t','uint16_t','int32_t','uint32_t','int64_t','uint64_t','size_t','ssize_t','intptr_t','uintptr_t','int_least8_t','uint_least8_t','int_least16_t','uint_least16_t','int_least32_t','uint_least32_t']);
+function tokenize(code){
+  const toks = [];
+  const re = /(\/\/[^\n]*|\/\*[\s\S]*?\*\/)|("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')|\b(0[xX][0-9a-fA-F]+|\d+[uUlL]*|[0-9]+(?:\.[0-9]*)?(?:[eE][+-]?\d+)?f?)\b|(\b[a-zA-Z_]\w*\b)|([#][a-zA-Z]+)|([{}()\[\];,.:=+\-*/%&|^!~<>?]+)/g;
+  let m;
+  while ((m = re.exec(code))){
+    const start = m.index, text = m[0];
+    let cls;
+    if (m[1]) cls = 'asm-src';          // comment
+    else if (m[2]) cls = 'asm-imm';     // string/char
+    else if (m[3]) cls = 'asm-imm';     // number
+    else if (m[4]) {
+      cls = C_KEYWORDS.has(text) ? 'asm-op' : (C_TYPES.has(text) ? 'asm-op' : 'asm-reg');
+    }
+    else if (m[5]) cls = 'asm-label';   // preprocessor
+    else if (m[6]) cls = 'asm-op';      // operators
+    toks.push({ text, start, end: start+text.length, cls });
+  }
+  return toks;
+}
+
+/* ================================================================
+ * 编译
+ * ================================================================ */
+const Settings = {
+  flash: 0x08000000, ram: 0x20000000, ramSize: 0x8000,
+  opt: 2, encoding: 'utf8', startup: true, srcAsm: true,
+};
+let lastResult = null;
+
+function readSettingsFromUI(){
+  const parse = (s, dflt)=> { const v = parseInt(s, 0); return isNaN(v)?dflt:v; };
+  Settings.flash = parse($('setFlash').value, 0x08000000);
+  Settings.ram = parse($('setRam').value, 0x20000000);
+  Settings.ramSize = parse($('setRamSize').value, 0x8000);
+  Settings.opt = parseInt($('setOpt').value, 10);
+  Settings.encoding = $('setEncoding').value;
+  Settings.startup = parseInt($('setStartup').value, 10) === 1;
+  Settings.srcAsm = $('setSrcAsm').checked;
+}
+function applySettingsToUI(){
+  $('setFlash').value = '0x'+Settings.flash.toString(16);
+  $('setRam').value = '0x'+Settings.ram.toString(16);
+  $('setRamSize').value = '0x'+Settings.ramSize.toString(16);
+  $('setOpt').value = String(Settings.opt);
+  $('setEncoding').value = Settings.encoding;
+  $('setStartup').value = Settings.startup ? '1':'0';
+  $('setSrcAsm').checked = Settings.srcAsm;
+  $('sbOptimize').textContent = '⚡ -O' + Settings.opt;
+}
+
+function compile(){
+  // 保存当前编辑器内容
+  const node = Project.activePath ? Project.nodes[Project.activePath] : null;
+  if (node) node.content = $('editorTextarea').value;
+
+  clearOutput();
+  addLog('══════ stdcc 编译开始 ══════', 'info');
+  const t0 = performance.now();
+
+  // 确定入口文件
+  if (!Project.mainFile){
+    const cMain = findCFile();
+    if (cMain) Project.mainFile = cMain.path;
+  }
+  const mainNode = Project.mainFile ? Project.nodes[Project.mainFile] : null;
+  if (!mainNode || !mainNode.content){
+    addLog('❌ 未找到入口 C 文件（main.c）。请在文件树中打开一个 .c 文件作为编译入口。', 'err');
+    setStatus('编译失败', true);
+    return;
+  }
+
+  // 提供编译器虚拟文件系统
+  globalThis.__STDCC_FS__ = VFS;
+
+  addLog(`▶ 入口文件: ${mainNode.path}`);
+  addLog(`▶ 优化级别: O${Settings.opt} · 编码: ${Settings.encoding} · 启动: ${Settings.startup?'标准启动(向量表)':'轻量桩'}`);
+  addLog(`▶ Flash=0x${Settings.flash.toString(16)} RAM=0x${Settings.ram.toString(16)} RAM大小=0x${Settings.ramSize.toString(16)}`);
+
+  const opts = {
+    optimize: Settings.opt,
+    encoding: Settings.encoding,
+    stringEncoding: Settings.encoding,
+    withStartup: Settings.startup,
+    srcAsm: Settings.srcAsm,
+    flashAddr: Settings.flash,
+    ramAddr: Settings.ram,
+    ramSize: Settings.ramSize,
+    includePaths: ['include'],
+  };
+
+  try {
+    const result = StdccCompiler.compile(mainNode.content, mainNode.path, opts);
+    const dt = (performance.now() - t0).toFixed(1);
+    if (result.hasError){
+      addLog('', '');
+      addLog('✗ 编译失败（' + result.stage + '）', 'err');
+      addLog('', '');
+      (result.error||'').split('\n').forEach(l=>addLog(l, 'err'));
+      setStatus('编译失败 · ' + dt + 'ms', true);
+      // 渲染汇编 tab（尽力而为）
+      renderAsmTab(result.asmLines || [], mainNode.content);
+      renderHexTab(result.flashBytes || [], Settings.flash, result.sizes);
+      return;
+    }
+    lastResult = result;
+    renderOutputTab(result);
+    renderHexTab(result.flashBytes, Settings.flash, result.sizes);
+    renderAsmTab(result.asmLines, mainNode.content);
+
+    addLog('', '');
+    addLog('✔ 编译成功', 'ok');
+    const s = result.summary;
+    addLog(`  flash: ${s.flashSize} 字节 | text=${s.text} rodata=${s.rodata} data=${s.data}`);
+    addLog(`  入口: 0x${(s.entry>>>0).toString(16)} | RAM: ${s.ramSize} 字节`);
+    if (result.runtime.needsDiv) addLog('  已链接: 软除法运行时', 'info');
+    if (result.runtime.needsFloat) addLog('  已链接: 软浮点 + 数学库', 'info');
+    if (result.warnings && result.warnings.length){
+      result.warnings.forEach(w=>addLog('⚠ ' + w, 'warn'));
+    }
+    addLog('  耗时: ' + dt + ' ms', 'info');
+    setStatus('编译成功 · ' + dt + 'ms', false);
+    $('btnDownloadBin').disabled = false;
+    $('btnDownloadHex').disabled = false;
+  } catch (e){
+    addLog('✗ 运行时错误:', 'err');
+    addLog((e && (e.stack||e.message)) || String(e), 'err');
+    setStatus('编译异常', true);
+  }
+}
+
+/* ---------- 编译输出 tab ---------- */
+function renderOutputTab(result){
+  // 已通过 addLog 输出，无需额外
+}
+
+/* ---------- HEX 预览 tab ---------- */
+function renderHexTab(bytes, baseAddr, sizes){
+  const body = $('outBody');
+  // 若当前不在 hex tab，先渲染到内存，切换时再显示
+  _hexData = { bytes, baseAddr, sizes };
+  if (document.querySelector('.out-tab.active')?.dataset.tab === 'hex') renderHexBody();
+}
+let _hexData = null;
+function renderHexBody(){
+  const body = $('outBody');
+  const d = _hexData;
+  if (!d || !d.bytes.length){ body.innerHTML = '<div class="out-empty">暂无 HEX 数据（请先编译）</div>'; return; }
+  const bytes = d.bytes, baseAddr = d.baseAddr;
+  let html = '<div class="hex-head">◆ Intel HEX 固件 · ' + bytes.length + ' 字节 · 起始 0x'+baseAddr.toString(16)+'</div><br>';
+  html += '<div class="hex-head">记录（S1 · 16 字节/行）:</div><br>';
+  // 生成 Intel HEX 文本
+  const lines = [];
+  const REC = 16;
+  for (let i=0;i<bytes.length;i+=REC){
+    const chunk = bytes.slice(i,i+REC);
+    const recAddr = (baseAddr + i) >>> 0;
+    const hi = (recAddr>>>16)&0xFFFF, lo = recAddr&0xFFFF;
+    lines.push({addr:recAddr, data:chunk});
+  }
+  for (const l of lines){
+    let hex = ':' + b2(l.data.length) + b2((l.addr>>>8)&0xFF) + b2(l.addr&0xFF) + '00';
+    let sum = l.data.length + ((l.addr>>>8)&0xFF) + (l.addr&0xFF);
+    for (const b of l.data){ hex += b2(b); sum += b; }
+    hex += b2((~sum+1)&0xFF);
+    // ASCII
+    let ascii = '';
+    for (const b of l.data){ ascii += (b>=32&&b<127) ? String.fromCharCode(b) : '.'; }
+    html += `<div class="log-line"><span class="hex-addr">0x${(l.addr>>>0).toString(16).padStart(8,'0')}</span>  <span class="hex-data">${hex}</span>  <span class="hex-ascii">|${ascii}|</span></div>`;
+  }
+  html += '<br><div class="hex-head">记录详情:</div>';
+  html += `<div class="log-line"><span class="hex-data">:${b2(2)}0000 04 (${(baseAddr>>>16).toString(16).toUpperCase().padStart(4,'0')}) 扩展线性地址</span></div>`;
+  for (const l of lines){
+    html += `<div class="log-line"><span class="hex-addr">0x${(l.addr>>>0).toString(16).padStart(8,'0')}</span>  <span class="hex-data">${bytesToRecord(l.addr, l.data)}</span></div>`;
+  }
+  html += '<div class="log-line"><span class="hex-data">:00000001FF</span>  EOF</div>';
+  html += '<br><div class="hex-head">◆ 分段大小:</div>';
+  html += `<div class="log-line">text=${d.sizes?d.sizes.text:'-'} · rodata=${d.sizes?d.sizes.rodata:'-'} · data=${d.sizes?d.sizes.data:'-'}</div>`;
+  body.innerHTML = html;
+}
+function bytesToRecord(addr, data){
+  let hex = ':' + b2(data.length) + b2((addr>>>8)&0xFF) + b2(addr&0xFF) + '00';
+  let sum = data.length + ((addr>>>8)&0xFF) + (addr&0xFF);
+  for (const b of data){ hex += b2(b); sum += b; }
+  hex += b2((~sum+1)&0xFF);
+  return hex;
+}
+function b2(n){ n &= 0xFF; return (n<16?'0':'')+n.toString(16).toUpperCase(); }
+
+/* ---------- C 汇编对照 tab ---------- */
+function renderAsmTab(asmLines, srcText){
+  _asmData = { asmLines, srcText };
+  if (document.querySelector('.out-tab.active')?.dataset.tab === 'asm') renderAsmBody();
+}
+let _asmData = null;
+function renderAsmBody(){
+  const body = $('outBody');
+  const d = _asmData;
+  if (!d || !d.asmLines || !d.asmLines.length){ body.innerHTML = '<div class="out-empty">暂无汇编（请先编译）</div>'; return; }
+  let html = '';
+  d.asmLines.forEach(line=>{
+    const t = String(line);
+    if (/^\s*@ ---/.test(t) || /^\s*@ ===/.test(t)){
+      html += `<div class="asm-line asm-src">${esc(t)}</div>`;
+    } else if (/^@/.test(t)){
+      html += `<div class="asm-line asm-src">${esc(t)}</div>`;
+    } else {
+      html += `<div class="asm-line">${escAsm(t)}</div>`;
+    }
+  });
+  body.innerHTML = html;
+}
+function escAsm(line){
+  // 简易汇编着色
+  const escLine = esc(line);
+  return escLine
+    .replace(/\b(r\d+|sp|lr|pc)\b/gi, m=>`<span class="asm-reg">${m}</span>`)
+    .replace(/(^|\s)([A-Z][A-Z0-9_]*:)/, (m,p,l)=>p+`<span class="asm-label">${l}</span>`)
+    .replace(/(#[0-9xXa-fA-F]+)/g, m=>`<span class="asm-imm">${m}</span>`)
+    .replace(/^(\s*)([A-Z][A-Z0-9.]*)/, (m,p,op)=>p+`<span class="asm-op">${op}</span>`);
+}
+
+/* ---------- 输出日志 ---------- */
+function addLog(msg, cls){
+  const body = $('outBody');
+  // 仅当在 output tab 时追加显示；始终存到 buffer
+  _logBuf.push({ msg, cls });
+  if (document.querySelector('.out-tab.active')?.dataset.tab === 'output'){
+    const d = document.createElement('div');
+    d.className = 'log-line ' + (cls||'');
+    d.textContent = msg;
+    body.appendChild(d);
+    body.scrollTop = body.scrollHeight;
+  }
+}
+let _logBuf = [];
+function clearOutput(){
+  _logBuf = [];
+  $('outBody').innerHTML = '';
+  _hexData = null; _asmData = null;
+  $('btnDownloadBin').disabled = true;
+  $('btnDownloadHex').disabled = true;
+}
+function renderOutputBody(){
+  const body = $('outBody');
+  body.innerHTML = '';
+  if (!_logBuf.length){ body.innerHTML = '<div class="out-empty">暂无编译输出。点击上方 ▶ 编译 按钮开始编译。</div>'; return; }
+  for (const l of _logBuf){
+    const d = document.createElement('div');
+    d.className = 'log-line ' + (l.cls||'');
+    d.textContent = l.msg;
+    body.appendChild(d);
+  }
+  body.scrollTop = body.scrollHeight;
+}
+
+/* ---------- 右侧 tab 切换 ---------- */
+document.querySelectorAll('.out-tab').forEach(tab=>{
+  tab.addEventListener('click', ()=>{
+    document.querySelectorAll('.out-tab').forEach(t=>t.classList.remove('active'));
+    tab.classList.add('active');
+    const which = tab.dataset.tab;
+    if (which === 'output') renderOutputBody();
+    else if (which === 'hex') renderHexBody();
+    else if (which === 'asm') renderAsmBody();
+  });
+});
+
+/* ---------- 状态栏 ---------- */
+function setStatus(msg, err){
+  const el = $('sbStatus');
+  el.textContent = (err?'⛔ ':'✔ ') + msg;
+  el.style.color = err ? '#ffd0c9' : '#fff';
+}
+
+/* ================================================================
+ * 下载
+ * ================================================================ */
+function downloadBlob(content, filename, mime){
+  const blob = content instanceof Uint8Array
+    ? new Blob([content], { type:mime })
+    : new Blob([content], { type:mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click();
+  setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 100);
+}
+function downloadBin(){
+  if (!lastResult) return;
+  const bytes = new Uint8Array(lastResult.flashBytes);
+  const name = (Project.mainFile||'').split('/').pop().replace(/\.c$/,'') + '.bin';
+  downloadBlob(bytes, name, 'application/octet-stream');
+  addLog('⬇ 已下载: ' + name + ' (' + bytes.length + ' 字节)', 'ok');
+}
+function downloadHex(){
+  if (!lastResult) return;
+  const text = StdccCompiler.compile ? makeHex(lastResult) : '';
+  const name = (Project.mainFile||'').split('/').pop().replace(/\.c$/,'') + '.hex';
+  downloadBlob(text, name, 'application/octet-stream');
+  addLog('⬇ 已下载: ' + name, 'ok');
+}
+function makeHex(result){
+  // 复用 bundle 的 HEX 生成逻辑
+  if (result.hex) return result.hex;
+  return '';
+}
+
+/* ================================================================
+ * 快捷键
+ * ================================================================ */
+document.addEventListener('keydown', (e)=>{
+  if ((e.ctrlKey||e.metaKey) && e.key === 'Enter'){ e.preventDefault(); compile(); }
+  if ((e.ctrlKey||e.metaKey) && e.key === 's'){ e.preventDefault(); saveCurrent(); }
+  if ((e.ctrlKey||e.metaKey) && e.key === 'b'){ e.preventDefault(); compile(); }
+});
+function saveCurrent(){
+  const node = Project.activePath ? Project.nodes[Project.activePath] : null;
+  if (node){
+    node.content = $('editorTextarea').value;
+    const ed = Project.openEditors.find(e=>e.path===node.path);
+    if (ed) ed.dirty = false;
+    setStatus('已保存 ' + node.name, false);
+  }
+}
+
+/* ================================================================
+ * 事件绑定 & 初始化
+ * ================================================================ */
+$('btnCompile').addEventListener('click', compile);
+$('btnDownloadBin').addEventListener('click', downloadBin);
+$('btnDownloadHex').addEventListener('click', downloadHex);
+$('btnOpenFolder').addEventListener('click', ()=>$('folderInput').click());
+$('btnNewFile').addEventListener('click', ()=>createFile('项目'));
+$('btnNewFolder').addEventListener('click', ()=>createFolder('项目'));
+$('mNewFile').addEventListener('click', ()=>createFile('项目'));
+$('mNewFolder').addEventListener('click', ()=>createFolder('项目'));
+$('mUpload').addEventListener('click', ()=>uploadTo('项目'));
+$('mRefresh').addEventListener('click', ()=>{ renderTree(); });
+// 内存设置模态
+$('btnMemSettings').addEventListener('click', ()=>{ applySettingsToUI(); $('settingsMask').classList.add('show'); });
+$('settingsClose').addEventListener('click', ()=>$('settingsMask').classList.remove('show'));
+$('settingsCancel').addEventListener('click', ()=>$('settingsMask').classList.remove('show'));
+$('settingsOk').addEventListener('click', ()=>{ readSettingsFromUI(); applySettingsToUI(); $('settingsMask').classList.remove('show'); addLog('⚙ 已应用编译设置', 'info'); });
+$('settingsMask').addEventListener('click', (e)=>{ if (e.target === $('settingsMask')) $('settingsMask').classList.remove('show'); });
+
+function esc(s){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+/* ---------- 启动 ---------- */
+initProject();
+renderTree();
+renderTabs();
+renderEditor();
+renderOutputBody();
+applySettingsToUI();
+addLog('✔ stdcc Web 编译器已就绪', 'ok');
+addLog('💡 在左侧文件树选择 main.c，点击顶部 ▶ 编译 或按 Ctrl+Enter', 'info');
+setStatus('就绪', false);
+
+// 检查编译器 bundle 是否加载
+if (typeof StdccCompiler === 'undefined'){
+  addLog('❌ 未找到编译器 bundle（webide_stdcc.js）。请先运行 node build_webide.js', 'err');
+  setStatus('编译器未加载', true);
+}
+</script>
+</body>
+</html>
