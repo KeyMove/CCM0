@@ -1,4 +1,4 @@
-# stdcc — JS 版标准 C 语言编译器（ARM Thumb）
+# [stdcc — JS 版标准 C 语言编译器（ARM Thumb）](https://keymove.github.io/CCM0/)
 
 一个用纯 JavaScript 实现的标准 C11 编译器，目标为 ARM Cortex-M0 (Thumb-1)，
 完全遵循经典编译器标准流程，可将 C 源码编译为可烧录的 `.bin` 固件。
