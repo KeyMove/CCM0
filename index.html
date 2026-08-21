@@ -123,17 +123,6 @@ body{
 .editor-breadcrumb .bc-item{ cursor:default; }
 .editor-breadcrumb .bc-folder{ color:var(--accent); }
 .editor-container{ flex:1; position:relative; overflow:auto; background:var(--syntax-bg); }
-#editorTextarea{
-  position:absolute; inset:0; width:100%; height:100%; border:none; outline:none; resize:none;
-  background:transparent; color:transparent; caret-color:var(--fg-bright);
-  font-family:'JetBrains Mono','Cascadia Code',Consolas,Menlo,monospace; font-size:13px; line-height:20px;
-  padding:10px 14px; tab-size:4; white-space:pre; overflow:auto;
-}
-#editorHighlight{
-  position:absolute; inset:0; padding:10px 14px; pointer-events:none; overflow:hidden;
-  font-family:'JetBrains Mono','Cascadia Code',Consolas,Menlo,monospace; font-size:13px; line-height:20px;
-  white-space:pre; word-wrap:break-word; color:var(--fg); tab-size:4;
-}
 .editor-linebar{
   flex:0 0 46px; background:var(--bg2); border-right:1px solid var(--border); overflow:hidden;
   font-family:monospace; font-size:12px; line-height:20px; padding:10px 8px 0; text-align:right; color:var(--fg-dim);
@@ -177,6 +166,38 @@ body{
 .statusbar .link{ cursor:pointer; }
 .statusbar .link:hover{ text-decoration:underline; }
 
+/* ======================= IDE.JS 编辑器配色 (VSCode 风格) ======================= */
+.ide-editor-wrap{
+  flex:1 1 auto; min-height:0; display:flex; flex-direction:row; overflow:hidden;
+  background:#11141c;
+}
+.ide-gutter{
+  flex:0 0 auto; width:52px; overflow:hidden; background:#0d1017; border-right:1px solid #232a38;
+  color:#4b5670; font-family:'SF Mono',Consolas,'Liberation Mono',Menlo,monospace;
+  font-size:13px; line-height:1.55; text-align:right; padding:12px 8px 12px 0; user-select:none; white-space:pre;
+}
+.ide-gutter div{ height:1.55em; }
+.ide-editor-box{ flex:1 1 auto; position:relative; min-width:0; overflow:hidden; }
+.ide-editor{
+  position:absolute; inset:0; margin:0; border:none; padding:12px 14px; white-space:pre;
+  tab-size:4; font-family:'SF Mono',Consolas,'Liberation Mono',Menlo,monospace;
+  font-size:13px; line-height:1.55; overflow:auto; resize:none; outline:none;
+}
+textarea.ide-editor{ color:transparent; background:transparent; caret-color:#e6ebf2; z-index:2;
+  -webkit-text-fill-color:transparent; }
+pre.ide-editor{ color:#e6ebf2; z-index:1; pointer-events:none; }
+.c-tok-kw{ color:#c792ea; }
+.c-tok-str{ color:#c3e88d; }
+.c-tok-num{ color:#f78c6c; }
+.c-tok-com{ color:#637777; font-style:italic; }
+.c-tok-fn{ color:#82aaff; }
+.c-tok-pre{ color:#ffcb6b; }
+/* 编辑区（ide.js 风格）内的高亮 token 配色，覆盖汇编 tab 默认色 */
+.ide-editor-wrap .asm-src{ color:#637777; font-style:italic; }
+.ide-editor-wrap .asm-imm{ color:#f78c6c; }
+.ide-editor-wrap .asm-op{ color:#c792ea; }
+.ide-editor-wrap .asm-reg{ color:#82aaff; }
+.ide-editor-wrap .asm-label{ color:#ffcb6b; }
 /* ======================= MODAL ======================= */
 .modal-mask{
   position:fixed; inset:0; background:rgba(0,0,0,.55); display:none; align-items:center; justify-content:center; z-index:100;
@@ -296,11 +317,11 @@ body{
   <div class="editor-wrap">
     <div class="editor-tabs" id="editorTabs"></div>
     <div class="editor-breadcrumb" id="breadcrumb"></div>
-    <div class="editor-body">
-      <div class="editor-linebar" id="linebar">1</div>
-      <div class="editor-container">
-        <div id="editorHighlight"></div>
-        <textarea id="editorTextarea" spellcheck="false" wrap="off" placeholder="// 打开或新建一个 C 文件开始编写..."></textarea>
+    <div class="ide-editor-wrap" id="editorWrap">
+      <div class="ide-gutter" id="linebar">1</div>
+      <div class="ide-editor-box">
+        <pre class="ide-editor" id="editorHighlight" aria-hidden="true"></pre>
+        <textarea class="ide-editor" id="editorTextarea" spellcheck="false" wrap="off" placeholder="// 打开或新建一个 C 文件开始编写..."></textarea>
       </div>
     </div>
   </div>
@@ -391,6 +412,7 @@ body{
   <div class="ctx-item" data-act="rename">✏️ 重命名</div>
   <div class="ctx-item" data-act="upload">⬆ 上传文件到此处</div>
   <div class="ctx-sep"></div>
+  <div class="ctx-item" data-act="download">⬇ 下载</div>
   <div class="ctx-item danger" data-act="delete">🗑 删除</div>
 </div>
 
@@ -429,7 +451,77 @@ const Project = {
   mainFile: null,       // 编译入口
   nodes: {},            // path -> node
   idc: 0,
+  dirHandle: null,      // FileSystemDirectoryHandle（直通模式）
+  directFS: false,      // 是否启用 showDirectoryPicker 直通
 };
+
+/* ---------- 文件系统直通（File System Access API） ---------- */
+function fsAccessSupported(){
+  return typeof window.showDirectoryPicker === 'function';
+}
+// 将节点的相对路径（去掉根目录名）转为目录句柄下的子路径数组
+function relPartsOf(nodePath){
+  const rootName = Project.root ? Project.root.name : '';
+  let p = nodePath;
+  if (rootName && p.startsWith(rootName + '/')) p = p.slice(rootName.length + 1);
+  return p ? p.split('/') : [];
+}
+async function fsGetHandle(nodePath){
+  if (!Project.dirHandle) return null;
+  const parts = relPartsOf(nodePath);
+  let h = Project.dirHandle;
+  for (const part of parts){
+    h = await h.getDirectoryHandle(part); // 最后一段若是文件会抛错，调用方需区分
+  }
+  return h;
+}
+async function fsGetFileHandle(nodePath, create){
+  if (!Project.dirHandle) return null;
+  const parts = relPartsOf(nodePath);
+  const fileName = parts.pop();
+  let h = Project.dirHandle;
+  for (const part of parts){
+    h = await h.getDirectoryHandle(part, { create:true });
+  }
+  return h.getFileHandle(fileName, { create: !!create });
+}
+async function fsWriteFile(nodePath, content){
+  const fh = await fsGetFileHandle(nodePath, true);
+  if (!fh) return false;
+  const w = await fh.createWritable();
+  await w.write(content);
+  await w.close();
+  return true;
+}
+async function fsMkdir(nodePath){
+  if (!Project.dirHandle) return false;
+  const parts = relPartsOf(nodePath);
+  let h = Project.dirHandle;
+  for (const part of parts){
+    h = await h.getDirectoryHandle(part, { create:true });
+  }
+  return true;
+}
+async function fsRemove(nodePath){
+  if (!Project.dirHandle) return false;
+  const parts = relPartsOf(nodePath);
+  const name = parts.pop();
+  let h = Project.dirHandle;
+  for (const part of parts){
+    h = await h.getDirectoryHandle(part);
+  }
+  await h.removeEntry(name, { recursive:true });
+  return true;
+}
+// 把内存树同步写回磁盘（直通模式下编译后调用）
+async function fsSyncAll(){
+  if (!Project.directFS || !Project.dirHandle) return;
+  for (const node of Object.values(Project.nodes)){
+    if (node.isDir) continue;
+    if (node.content === undefined || node.content === null) continue;
+    try { await fsWriteFile(node.path, node.content); } catch(e){ /* ignore */ }
+  }
+}
 
 function newFileNode(name, content){
   return { id:'n'+(++Project.idc), name, content: content||'', isDir:false, children:null };
@@ -754,6 +846,7 @@ $('ctxMenu').addEventListener('click', (e)=>{
     case 'newfolder': createFolder(isDir ? node.path : parentPath); break;
     case 'rename': renameNode(node); break;
     case 'upload': uploadTo(isDir ? node.path : parentPath); break;
+    case 'download': downloadNode(node); break;
     case 'delete': deleteNode(node); break;
   }
 });
@@ -784,6 +877,7 @@ function createFile(dirPath){
   indexNodes(); indexVFS();
   renderTree();
   openFile(node);
+  if (Project.directFS){ fsWriteFile(node.path, '').catch(()=>{}); }
 }
 function createFolder(dirPath){
   const name = prompt('新建文件夹名:');
@@ -795,6 +889,7 @@ function createFolder(dirPath){
   dir.children.push(newDirNode(clean));
   indexNodes(); indexVFS();
   renderTree();
+  if (Project.directFS){ fsMkdir(dirPath + '/' + clean).catch(()=>{}); }
 }
 function renameNode(node){
   const name = prompt('重命名为:', node.name);
@@ -814,6 +909,20 @@ function renameNode(node){
   if (Project.activePath === oldPath) Project.activePath = node.path;
   if (Project.mainFile === oldPath) Project.mainFile = node.path;
   renderTree(); renderTabs(); renderEditor();
+  if (Project.directFS){
+    (async ()=>{
+      try {
+        if (!node.isDir){
+          const content = node.content || '';
+          await fsWriteFile(node.path, content);
+          await fsRemove(oldPath);
+        } else {
+          await fsMkdir(node.path);
+          await fsRemove(oldPath);
+        }
+      } catch(e){ /* ignore */ }
+    })();
+  }
 }
 function deleteNode(node){
   const msg = node.isDir ? `确定删除文件夹「${node.name}」及其内容？` : `确定删除文件「${node.name}」？`;
@@ -831,6 +940,7 @@ function deleteNode(node){
   if (affected.includes(Project.mainFile)) Project.mainFile = null;
   indexNodes(); indexVFS();
   renderTree(); renderTabs(); renderEditor();
+  if (Project.directFS){ fsRemove(node.path).catch(()=>{}); }
 }
 function uploadTo(dirPath){
   $('fileUpload').dataset.dir = dirPath;
@@ -844,18 +954,56 @@ $('fileUpload').addEventListener('change', (e)=>{
     if (dir.children.some(c=>c.name===name)) continue;
     const reader = new FileReader();
     reader.onload = ()=> {
-      dir.children.push(newFileNode(name, reader.result));
+      const node = newFileNode(name, reader.result);
+      dir.children.push(node);
       indexNodes(); indexVFS(); renderTree();
+      if (Project.directFS){ fsWriteFile(node.path, reader.result || '').catch(()=>{}); }
     };
     reader.readAsText(f);
   }
   e.target.value = '';
 });
 
-/* 打开文件夹（webkitdirectory 多文件上传，重建文件树） */
+/* 打开文件夹（直通模式：File System Access API） */
+async function openFolderDirect(handle){
+  Project.dirHandle = handle;
+  Project.directFS = true;
+  const rootName = handle.name || '项目';
+  const newRoot = newDirNode(rootName);
+  let count = 0;
+  await readDirRecursive(handle, newRoot, ()=>{ count++; });
+  Project.root = newRoot;
+  indexNodes(); indexVFS();
+  const cMain = findCFile();
+  if (cMain){ Project.mainFile = cMain.path; openFile(cMain); }
+  renderTree(); renderTabs(); renderEditor();
+  addLog('已打开文件夹（直通）：' + rootName + '，共 ' + count + ' 个文件', 'ok');
+  setStatus('直通模式 · 改动将写回本地', false);
+}
+async function readDirRecursive(dirHandle, dirNode, onFile){
+  for await (const [name, entry] of dirHandle.entries()){
+    if (entry.kind === 'file'){
+      let content = '';
+      try {
+        const file = await entry.getFile();
+        content = await file.text();
+      } catch(e){ content = ''; }
+      dirNode.children.push(newFileNode(name, content));
+      onFile();
+    } else if (entry.kind === 'directory'){
+      const sub = newDirNode(name);
+      dirNode.children.push(sub);
+      await readDirRecursive(entry, sub, onFile);
+    }
+  }
+}
+
+/* 打开文件夹（webkitdirectory 多文件上传，重建文件树，回退方案） */
 $('folderInput').addEventListener('change', (e)=>{
   const files = Array.from(e.target.files);
   if (!files.length) return;
+  Project.directFS = false;
+  Project.dirHandle = null;
   // 构建完整目录树
   const newRoot = newDirNode('项目');
   const map = { '': newRoot };
@@ -910,7 +1058,7 @@ function readAllFiles(files, cb){
   files.forEach(f=>{
     const rel = f.webkitRelativePath || f.name;
     const parts = rel.split('/'); parts.shift();
-    const path = parts.join('/');
+    const path = (Project.root.name ? Project.root.name + '/' : '') + parts.join('/');
     const node = Project.nodes[path];
     if (!node || node.isDir) return;
     pending++;
@@ -1006,15 +1154,18 @@ $('editorTextarea').addEventListener('input', ()=>{
   highlight(node.content, $('editorHighlight'));
   updateLinebar();
 });
-$('editorTextarea').addEventListener('scroll', ()=>{
-  $('editorHighlight').scrollTop = $('editorTextarea').scrollTop;
-  $('editorHighlight').scrollLeft = $('editorTextarea').scrollLeft;
-});
+$('editorTextarea').addEventListener('scroll', syncIdeScroll);
+function syncIdeScroll(){
+  const ta = $('editorTextarea');
+  $('editorHighlight').scrollTop = ta.scrollTop;
+  $('editorHighlight').scrollLeft = ta.scrollLeft;
+  $('linebar').scrollTop = ta.scrollTop;
+}
 function updateLinebar(){
   const n = $('editorTextarea').value.split('\n').length;
   let s='';
-  for(let i=1;i<=n;i++) s+=i+'\n';
-  $('linebar').textContent = s.slice(0,-1);
+  for(let i=1;i<=n;i++) s += '<div>'+i+'</div>';
+  $('linebar').innerHTML = s;
 }
 
 /* ---------- 语法高亮 ---------- */
@@ -1082,7 +1233,7 @@ function applySettingsToUI(){
   $('sbOptimize').textContent = '⚡ -O' + Settings.opt;
 }
 
-function compile(){
+async function compile(){
   // 保存当前编辑器内容
   const node = Project.activePath ? Project.nodes[Project.activePath] : null;
   if (node) node.content = $('editorTextarea').value;
@@ -1155,6 +1306,14 @@ function compile(){
     setStatus('编译成功 · ' + dt + 'ms', false);
     $('btnDownloadBin').disabled = false;
     $('btnDownloadHex').disabled = false;
+    if (Project.directFS){
+      try {
+        await fsSyncAll();
+        addLog('💾 已写回本地文件夹', 'ok');
+      } catch(e){
+        addLog('⚠ 写回本地失败: ' + (e && e.message || e), 'err');
+      }
+    }
   } catch (e){
     addLog('✗ 运行时错误:', 'err');
     addLog((e && (e.stack||e.message)) || String(e), 'err');
@@ -1219,6 +1378,30 @@ function bytesToRecord(addr, data){
   return hex;
 }
 function b2(n){ n &= 0xFF; return (n<16?'0':'')+n.toString(16).toUpperCase(); }
+
+/* ---------- 右键下载（非直通浏览器的主要导出方式） ---------- */
+async function downloadNode(node){
+  if (!node) return;
+  if (!node.isDir){
+    downloadBlob(node.name, new Blob([node.content !== undefined ? node.content : ''], { type:'text/plain' }));
+    return;
+  }
+  // 文件夹：递归逐文件下载，文件名带相对路径前缀以保留结构
+  const rootName = Project.root ? Project.root.name + '/' : '';
+  let n = 0;
+  (function walk(dir){
+    for (const c of dir.children){
+      if (c.isDir){ walk(c); }
+      else {
+        const rel = c.path.startsWith(rootName) ? c.path.slice(rootName.length) : c.path;
+        const safeName = rel.replace(/\//g, '_');
+        downloadBlob(safeName, new Blob([c.content !== undefined ? c.content : ''], { type:'text/plain' }));
+        n++;
+      }
+    }
+  })(node);
+  addLog('已下载文件夹（' + n + ' 个文件，含相对路径前缀）', 'ok');
+}
 
 /* ---------- C 汇编对照 tab ---------- */
 function renderAsmTab(asmLines, srcText){
@@ -1347,13 +1530,21 @@ document.addEventListener('keydown', (e)=>{
   if ((e.ctrlKey||e.metaKey) && e.key === 's'){ e.preventDefault(); saveCurrent(); }
   if ((e.ctrlKey||e.metaKey) && e.key === 'b'){ e.preventDefault(); compile(); }
 });
-function saveCurrent(){
+async function saveCurrent(){
   const node = Project.activePath ? Project.nodes[Project.activePath] : null;
-  if (node){
-    node.content = $('editorTextarea').value;
-    const ed = Project.openEditors.find(e=>e.path===node.path);
-    if (ed) ed.dirty = false;
-    setStatus('已保存 ' + node.name, false);
+  if (!node) return;
+  node.content = $('editorTextarea').value;
+  const ed = Project.openEditors.find(e=>e.path===node.path);
+  if (ed) ed.dirty = false;
+  if (Project.directFS){
+    try {
+      await fsWriteFile(node.path, node.content);
+      setStatus('已保存并写回本地 ' + node.name, false);
+    } catch(e){
+      setStatus('保存失败（本地写入）: ' + (e && e.message || e), true);
+    }
+  } else {
+    setStatus('已保存 ' + node.name + '（内存，需右键下载）', false);
   }
 }
 
@@ -1363,7 +1554,20 @@ function saveCurrent(){
 $('btnCompile').addEventListener('click', compile);
 $('btnDownloadBin').addEventListener('click', downloadBin);
 $('btnDownloadHex').addEventListener('click', downloadHex);
-$('btnOpenFolder').addEventListener('click', ()=>$('folderInput').click());
+$('btnOpenFolder').addEventListener('click', openFolder);
+async function openFolder(){
+  if (fsAccessSupported()){
+    try {
+      const handle = await window.showDirectoryPicker();
+      await openFolderDirect(handle);
+      return;
+    } catch(e){
+      if (e && e.name === 'AbortError') return; // 用户取消
+      addLog('⚠ 无法访问文件系统，回退到上传模式：' + (e && e.message || e), 'info');
+    }
+  }
+  $('folderInput').click(); // 回退到 webkitdirectory 上传
+}
 $('btnNewFile').addEventListener('click', ()=>createFile('项目'));
 $('btnNewFolder').addEventListener('click', ()=>createFolder('项目'));
 $('mNewFile').addEventListener('click', ()=>createFile('项目'));
