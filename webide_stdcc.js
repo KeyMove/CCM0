@@ -28,6 +28,25 @@ function __load(id) {
 
 
 /* ---- browser shims ---- */
+// Buffer 浏览器 shim（optimizer 用 Buffer.from(initBytes).readUInt32LE 读全局常量初值）
+if (typeof Buffer === 'undefined') {
+  var Buffer = {
+    from: function(arr) {
+      // 将字节数组包装为可读对象（仅实现 compile 用到的接口）
+      var bytes = (arr && arr.slice) ? arr.slice() : [];
+      return {
+        _bytes: bytes,
+        readUInt32LE: function(off) {
+          var b = this._bytes;
+          return ((b[off]||0) | ((b[off+1]||0)<<8) | ((b[off+2]||0)<<16) | ((b[off+3]||0)<<24)) >>> 0;
+        },
+        toString: function() { return ''; }
+      };
+    }
+  };
+  if (typeof globalThis !== 'undefined') globalThis.Buffer = Buffer;
+  else if (typeof window !== 'undefined') window.Buffer = Buffer;
+}
 var __stdccShim = function(name) {
   if (name === 'fs') {
     return {
@@ -2706,7 +2725,11 @@ class SemanticAnalyzer {
       case 'Paren': expr.type = this.analyzeExpr(expr.expr); return expr.type;
       case 'Unary': {
         const t = this.analyzeExpr(expr.operand);
-        if (expr.op === '+' || expr.op === '-') expr.type = t;
+        // 前置/后置 ++ / -- 的结果保持操作数类型（含指针），否则 `*p++` 的 Deref
+        // 会把 p++ 误判为 int，导致 u8* 解引用被当成 32 位字读（LDR）而非法对齐。
+        if (expr.op === '+' || expr.op === '-' ||
+            expr.op === 'prefix++' || expr.op === 'prefix--' ||
+            expr.op === 'postfix++' || expr.op === 'postfix--') expr.type = t;
         else if (expr.op === '~' || expr.op === '!') expr.type = basic('int');
         else expr.type = basic('int');
         return expr.type;
@@ -2927,6 +2950,7 @@ const IR_OP = {
   CAST: 'cast',
   VB: 'vb',   // volatile barrier
   UMULHI: 'umulhi',  // 无符号 32x32 → 高 32 位（调用 __umulhi32，dst = mulhi(a, b)）
+  DIVMOD: 'divmod',  // 无符号 32x32 同时返回 商(dst) 与 余(dstRem)（调用 __udivmod32）
 };
 
 class IRBuilder {
@@ -2966,7 +2990,7 @@ class IRBuilder {
   sys(n, argc) { return this.emit({ op: IR_OP.SYS, n, argc }); }
   param(v) { return this.emit({ op: IR_OP.PARAM, v }); }
   areg(idx, v) { return this.emit({ op: IR_OP.AREG, idx, v }); }
-  argp(idx, offset) { return this.emit({ op: IR_OP.ARGP, idx, offset }); }
+  argp(idx, offset, size = 4) { return this.emit({ op: IR_OP.ARGP, idx, offset, size }); }
   ret(v) { return this.emit({ op: IR_OP.RET, v }); }
   label(name) { return this.emit({ op: IR_OP.LABEL, name }); }
   enter(fnName, localsSize, interruptSlot) { return this.emit({ op: IR_OP.ENTER, fnName, localsSize, interruptSlot }); }
@@ -2982,6 +3006,7 @@ function irToString(inst) {
   switch (inst.op) {
     case IR_OP.LABEL: return `${inst.name}:`;
     case IR_OP.MOV: return `${inst.dst} = ${inst.src}`;
+    case IR_OP.DIVMOD: return `${inst.dst} = ${inst.a} divmod ${inst.b} (rem=${inst.dstRem})`;
     case IR_OP.ADD: case IR_OP.SUB: case IR_OP.MUL: case IR_OP.DIV: case IR_OP.MOD:
     case IR_OP.AND: case IR_OP.OR: case IR_OP.XOR: case IR_OP.SHL: case IR_OP.SHR:
       return `${inst.dst} = ${inst.a} ${inst.op} ${inst.b}`;
@@ -3444,7 +3469,7 @@ class IRGenerator {
           size,
           type: ptype || p.type,
         });
-        this.ir.argp(idx, slot.offset);
+        this.ir.argp(idx, slot.offset, size);
       }
     }
     // 2) 栈参数：偏移 20 + (idx-nReg)*4（正偏移，相对 PUSH 后的 SP；codegen 按实际 pushBytes 修正）
@@ -3845,6 +3870,7 @@ class IRGenerator {
     this.breakLabels.push(endLabel);
     const val = this.genExpr(stmt.expr);
     const cases = [];
+    let hasDefault = false;
     const defaultLabel = this.ir.newLabel();
     const caseLabelMap = new Map(); // 每个 Case/Default 节点的标签
     // 收集所有 case 值
@@ -3855,6 +3881,7 @@ class IRGenerator {
         caseLabelMap.set(s, lbl);
         cases.push({ value: s.value, label: lbl });
       } else if (s.kind === 'Default') {
+        hasDefault = true;
         caseLabelMap.set(s, defaultLabel);
         cases.push({ default: true, label: defaultLabel });
       } else if (s.kind === 'Compound') {
@@ -3871,7 +3898,8 @@ class IRGenerator {
       this.ir.cmp(val, tmp);
       this.ir.jcc(IR_OP.JEQ, null, c.label);
     }
-    this.ir.jmp(defaultLabel);
+    // 若无 default 分支，无匹配时应跳转到 switch 末尾（endLabel），而非悬空的 defaultLabel
+    this.ir.jmp(hasDefault ? defaultLabel : endLabel);
     // 生成 case 体（在相应位置打标签）
     const genBody = (s) => {
       if (!s) return;
@@ -4022,24 +4050,38 @@ class IRGenerator {
         // 自增自减：计算地址，读取，加/减 1（指针按元素大小），写回，返回新值
         const addr = this.genLValue(expr.operand);
         const old = this.ir.newTemp();
-        this.ir.load(old, addr);
+        // 按操作数类型宽度选择读/写指令（u8/u16 必须窄读写，避免读到相邻字节）
+        const elemSize = this.sizeofCType(expr.operand.type) || 4;
+        const signed = this.isSigned(expr.operand.type);
+        if (elemSize === 1) this.ir.loadb(old, addr, signed);
+        else if (elemSize === 2) this.ir.loadh(old, addr, signed);
+        else this.ir.load(old, addr);
         const isInc = expr.op === 'prefix++';
         const inc = this.makeIncrement(expr.operand, 1, old);
         const result = this.ir.newTemp();
         // ++: result = old + 1；--: result = old - 1
         this.ir.bin(isInc ? IR_OP.ADD : IR_OP.SUB, result, old, inc);
-        this.ir.store(addr, result);
+        if (elemSize === 1) this.ir.storeb(addr, result);
+        else if (elemSize === 2) this.ir.storeh(addr, result);
+        else this.ir.store(addr, result);
         return result;
       }
       case 'postfix++': case 'postfix--': {
         const addr = this.genLValue(expr.operand);
         const old = this.ir.newTemp();
-        this.ir.load(old, addr);
+        // 按操作数类型宽度选择读/写指令（u8/u16 必须窄读写，避免读到相邻字节）
+        const elemSize = this.sizeofCType(expr.operand.type) || 4;
+        const signed = this.isSigned(expr.operand.type);
+        if (elemSize === 1) this.ir.loadb(old, addr, signed);
+        else if (elemSize === 2) this.ir.loadh(old, addr, signed);
+        else this.ir.load(old, addr);
         const isInc = expr.op === 'postfix++';
         const inc = this.makeIncrement(expr.operand, 1, old);
         const result = this.ir.newTemp();
         this.ir.bin(isInc ? IR_OP.ADD : IR_OP.SUB, result, old, inc);
-        this.ir.store(addr, result);
+        if (elemSize === 1) this.ir.storeb(addr, result);
+        else if (elemSize === 2) this.ir.storeh(addr, result);
+        else this.ir.store(addr, result);
         return old;
       }
       default: this.error(`不支持的一元运算 '${expr.op}'`);
@@ -4561,17 +4603,14 @@ class IRGenerator {
     }
 
     // 常规函数调用：实现寄存器 ABI（前 4 个参数走 R0-R3，其余压栈）。
-    // 若任一实参表达式含嵌套调用，退化为全栈传参以保证正确性。
-    const useReg = args.every(a => !this.exprHasCall(a));
-    const nReg = useReg ? Math.min(args.length, 4) : 0;
-    for (let i = 0; i < nReg; i++) {
-      const v = this.genExpr(args[i]);
-      this.ir.areg(i, v);
-    }
-    for (let i = args.length - 1; i >= nReg; i--) {
-      const v = this.genExpr(args[i]);
-      this.ir.param(v);
-    }
+    // 先把所有实参求值到临时量（避免嵌套调用在求值过程中破坏已就位的 R0-R3），
+    // 再统一把前 4 个实参载入 R0-R3、其余逆序压栈。
+    // 注意：被调函数的参数一律从 R0-R3 读取（寄存器 ABI），因此绝不能因某个实参
+    // 含嵌套调用就把全部参数退化为栈传参——那会让被调函数读到寄存器中的脏值。
+    const nReg = Math.min(args.length, 4);
+    const argVals = args.map(a => this.genExpr(a));
+    for (let i = 0; i < nReg; i++) this.ir.areg(i, argVals[i]);
+    for (let i = args.length - 1; i >= nReg; i--) this.ir.param(argVals[i]);
     this.ir.call(fnName, args.map((_, i) => i));
     this.ir.mov(t, 'R0');
     const stackArgc = args.length - nReg;
@@ -4763,6 +4802,16 @@ class Optimizer {
       // 死函数消除：删除从 main 不可达的函数（如未调用的辅助函数），
       // 避免为其生成冗余代码与数据，直接减小目标 ROM 体积。
       insts = this.deadFunctionElimination(insts, irModule.globals);
+      // 数字提取 divmod 链：识别 `%q = (%a MOD c1) DIV c2` 模式，用 __udivmod32
+      // 一次调用同时导出商与余数，替代 magic-number 取模 + 软件除法 的长序列
+      //（对标 Keil O3 用 __aeabi_uidivmod 串联数位提取）。须在 strengthReduction
+      //（magic number 展开）之前运行，才能捕获原始 DIV/MOD。
+      // 曾在 PR #60 暂不启用：它让大量数位提取中间值跨 DIVMOD 调用存活，超出
+      // callee-saved(R4/R5) 容量导致图着色/线性分配 spill 复杂、多级链结果错误。
+      // 现已在 codegen 的调用点（_callClobberCallerSaved）修复「跨调用存活临时量
+      // 被留在 caller-saved 寄存器、调用后未重载」的根因，多级链（5 位数）结果正确，
+      // 故重新启用本优化（对标 Keil 数位提取，显著缩小 ROM）。
+      insts = this.divModChain(insts);
       insts = this.strengthReduction(insts);
       insts = this.commonSubexprElimination(insts);
       insts = this.foldConstCmp(insts);
@@ -4771,6 +4820,9 @@ class Optimizer {
       // 位清空识别：把 a & ~x（IR 为 a and (x xor -1)）改写为 a BIC x，
       // 用单条 Thumb BIC 替代 MVN+EOR+AND 长序列，大幅缩小 ROM。
       insts = this.bitClearRecognition(insts);
+      // 全局常量指针内联：把「初始化为常量地址且从未被修改」的全局指针的装载折叠为常量，
+      // 使 *pa 直接基于就地合成基址访问，替代 LDR =addr; LDR [R] 间接访存。
+      insts = this.globalConstPropagate(insts, irModule.globals);
       // 全局指针装载缓存：同一函数内重复 `pa = *&GLOBAL[.g]`（未对全局重新赋值/跨调用）
       // 时复用首次装载的指针值，消除反复 `LDR =addr; LDR [R]` 的冗余内存访问。
       insts = this.globalPtrCSE(insts);
@@ -4784,6 +4836,12 @@ class Optimizer {
       // 提升为 IR 临时变量，交由后端寄存器分配器驻留到物理寄存器，消除内存流量。
       insts = this.scalarPromotion(insts);
       // 提升引入的局部临时变量会跨基本块存活，做一轮 DCE 清理纯死槽（首访为读才插入口装载）。
+      insts = this.deadCodeElimination(insts);
+      // 标量提升为 s8/s16 槽插入的「SHL24/SAR24 符号扩展」可能把常量变成
+      // 1<<24 / 0xFF<<24 再算术右移（如 dir=1 → 16777216 SAR 24）。常量折叠
+      // 补齐 SAR 支持后，在此再折叠一轮，把这类「字节扩展 + 算术右移还原」的
+      // 常量化简回 MOV #imm，避免后端走字面量池 + ASR 的长序列。
+      insts = this.constantFolding(insts);
       insts = this.deadCodeElimination(insts);
       // 复写传播：把 MOV dst,src 的 src 直接替换到 dst 的所有使用处，
       // 消除标量提升等 pass 引入的冗余 MOV（如 %t1 = %loc_add_0）。
@@ -4944,9 +5002,12 @@ class Optimizer {
       }
     }
 
-    // ---- 2) 安全闸门：有非全局计算地址访存 → 整函数跳过 -------
-    if (hasComputedMem) return insts;
-
+    // ---- 2) 安全闸门 -------
+    // hasComputedMem（非 LEA/非全局派生的计算地址访存，如 *p++ 解引用）只有“同时
+    // 存在栈槽地址逃逸”时才构成别名风险（计算地址可能指向逃逸栈槽）。若 leaEscaped=0
+    // （所有 LEA 临时仅被直接 LOAD/STORE 使用、地址不外逃），则任何外部/计算地址都
+    // 不可能指向待提升栈槽，可安全提升循环计数器等 u8 局部变量，避免整函数因一个
+    // *p++ 而跳过标量提升（UI_LoadBuff 等因此无法瘦身）。
     // 组装每个 LEA 对应槽访问信息；任何 LEA 逃逸（被直接访存之外使用）→ 整函数跳过
     const slot = new Map(); // off -> { off, firstApp, lastApp, firstIsStore, accesses:[] }
     const leaEscaped = new Set();
@@ -4966,6 +5027,7 @@ class Optimizer {
       });
       if (usedElsewhere) leaEscaped.add(off);
     }
+    if (hasComputedMem && leaEscaped.size > 0) return insts; // 计算地址访存且槽地址逃逸 → 跳过
     if (leaEscaped.size > 0) return insts; // 任一槽地址逃逸 → 整函数跳过（保守）
 
     // 按 off 聚合访问点
@@ -5114,8 +5176,8 @@ class Optimizer {
     for (const s of promote) locTemp.set(s.off, `%loc_${fnName}_${locCounter++}`);
 
     const newInsts = [];
-    let tempCounter = 100000;
-    const nt = () => `%prom${tempCounter++}`;
+    if (this._promTempCounter === undefined) this._promTempCounter = 100000;
+    const nt = () => `%prom${this._promTempCounter++}`;
 
     // 每个被提升槽：在 ENTER 后插入入口装载（从栈读到寄存器临时）。
     // 寄存器参数槽（有 ARGP 初值）的初值直接取传入寄存器 R{idx}，无需从栈装载。
@@ -5685,7 +5747,7 @@ class Optimizer {
       if (inst.op === IR_OP.ADD || inst.op === IR_OP.SUB || inst.op === IR_OP.MUL ||
           inst.op === IR_OP.DIV || inst.op === IR_OP.MOD || inst.op === IR_OP.AND ||
           inst.op === IR_OP.OR || inst.op === IR_OP.XOR || inst.op === IR_OP.SHL ||
-          inst.op === IR_OP.SHR) {
+          inst.op === IR_OP.SHR || inst.op === IR_OP.SAR) {
         const resolve = (x) => {
           if (this.isConst(x)) return x;
           if (typeof x === 'string' && constVal.has(x)) return constVal.get(x);
@@ -5709,6 +5771,7 @@ class Optimizer {
             case IR_OP.XOR: val = (av ^ bv) >>> 0; break;
             case IR_OP.SHL: val = (av << (bv & 31)) >>> 0; break;
             case IR_OP.SHR: val = av >>> (bv & 31); break;
+            case IR_OP.SAR: val = av >> (bv & 31); break;
           }
           result.push({ op: IR_OP.MOVI, dst: inst.dst, value: val });
           constVal.set(inst.dst, val);
@@ -6018,6 +6081,91 @@ class Optimizer {
     return result;
   }
 
+  /**
+   * 全局常量指针内联（Global Constant Pointer Fold）
+   *
+   * 嵌入式代码常用全局指针访问外设，如 `int *pa = 0x50000014;` 后大量 `*pa` 位操作。
+   * 若某全局（指针）初始化为 4 字节标量常量地址，且整个程序从未被修改（无任何 STORE），
+   * 则 `%a = &GLOBAL[.g]; %p = *%a` 可折叠为 `%p = <常量地址>`，从而把「先读全局再解引用」
+   * 的间接访存替换为「就地合成常量地址 + 直接解引用」，大幅消除 `LDR =addr; LDR [R]` 冗余，
+   * 并让后端用 MOVS+LSL 就地合成外设基址（对标 Keil O3 的基址合成）。
+   */
+  globalConstPropagate(insts, globals) {
+    // 1) 收集「初始化为 4 字节标量常量」的全局
+    const constInit = new Map(); // globalLabel -> 初始值
+    for (const g of globals || []) {
+      if (g.size === 4 && g.initBytes && g.initBytes.length >= 4) {
+        const b = Buffer.from(g.initBytes);
+        const v = b.readUInt32LE(0) >>> 0;
+        // 非零常量地址（0 也可能合法，但此处保守略过 0 避免误判 null 指针语义）
+        constInit.set(g.label, v);
+      }
+    }
+    if (constInit.size === 0) return insts;
+
+    // 2) 确定哪些全局被修改（传递闭包；含 SYS 副作用则全部视为可能修改）
+    const modSets = this._computeGlobalModSets(insts);
+    const anySys = [...(modSets ? modSets.values() : [])].some(m => m && m.has("*"));
+    const modded = new Set();
+    if (modSets) for (const m of modSets.values()) for (const g of m) if (g !== "*") modded.add(g);
+
+    // 2b) 对「被 STORE 但所有 STORE 都是与初值相同的常量」的全局，视为未实际修改：
+    //     嵌入式代码常在函数开头重赋同值指针（如 main 中 pa=(int*)0x50000014），
+    //     虽产生 STORE 但值不变，仍可安全折叠。
+    // 先构建「临时量 → 常量」映射（movi 直接 / mov 传递），供 store 值解析
+    const constOfTemp = new Map();
+    let curTmpFn = null;
+    for (const inst of insts) {
+      if (inst.op === IR_OP.ENTER) { curTmpFn = inst.fnName; constOfTemp.clear(); continue; }
+      if (inst.op === IR_OP.MOVI && typeof inst.dst === 'string') constOfTemp.set(inst.dst, inst.value >>> 0);
+      else if (inst.op === IR_OP.MOV && typeof inst.dst === 'string') {
+        if (typeof inst.src === 'number') constOfTemp.set(inst.dst, inst.src >>> 0);
+        else if (typeof inst.src === 'string' && constOfTemp.has(inst.src)) constOfTemp.set(inst.dst, constOfTemp.get(inst.src));
+        else constOfTemp.delete(inst.dst);
+      } else if (inst.op === IR_OP.LEA && typeof inst.dst === 'string') constOfTemp.delete(inst.dst);
+    }
+    const storeVals = new Map(); // globalLabel -> Set<常量值>
+    const leaForStore = new Map();
+    for (const inst of insts) {
+      if (inst.op === IR_OP.ENTER) { leaForStore.clear(); continue; }
+      if (inst.op === IR_OP.LEA && inst.base === 'GLOBAL') { leaForStore.set(inst.dst, inst.offset); continue; }
+      if (inst.op === IR_OP.STORE && typeof inst.dst === 'string' && leaForStore.has(inst.dst)) {
+        const gl = leaForStore.get(inst.dst);
+        if (!storeVals.has(gl)) storeVals.set(gl, new Set());
+        if (typeof inst.src === 'number') storeVals.get(gl).add(inst.src >>> 0);
+        else if (typeof inst.src === 'string' && constOfTemp.has(inst.src)) storeVals.get(gl).add(constOfTemp.get(inst.src));
+        else storeVals.get(gl).add('NONCONST'); // 非常量值 → 不可折叠
+      }
+    }
+    for (const [gl, vals] of storeVals) {
+      if (constInit.has(gl) && vals.size === 1 && !vals.has('NONCONST')
+          && vals.has(constInit.get(gl))) {
+        modded.delete(gl); // 所有 STORE 都等于初值 → 实际未修改
+      }
+    }
+
+    const result = [];
+    const leaG = new Map(); // leaTemp -> globalLabel
+    let curFn = null;
+    const isModified = (g) => anySys || modded.has(g);
+
+    for (const inst of insts) {
+      if (inst.op === IR_OP.ENTER) { curFn = inst.fnName; result.push(inst); continue; }
+      if (inst.op === IR_OP.LEA && inst.base === "GLOBAL") { leaG.set(inst.dst, inst.offset); result.push(inst); continue; }
+      if (inst.op === IR_OP.LOAD && typeof inst.src === "string" && leaG.has(inst.src)) {
+        const gl = leaG.get(inst.src);
+        if (constInit.has(gl) && !isModified(gl)) {
+          // 折叠：%p = <常量地址>，替代 LEA+LOAD
+          result.push({ op: IR_OP.MOVI, dst: inst.dst, value: constInit.get(gl), line: inst.line });
+          continue;
+        }
+        result.push(inst);
+        continue;
+      }
+      result.push(inst);
+    }
+    return result;
+  }
   globalPtrCSE(insts) {
     // 计算「每个函数传递性写入的全局符号集合」：供跨函数调用缓存全局指针值使用。
     // 若被调用函数（及它传递调用的函数）都不写某全局，则该全局在调用点后可安全复用缓存，
@@ -6321,6 +6469,13 @@ class Optimizer {
               continue;
             }
             if (inst.op === IR_OP.MOD) {
+              if (inst.unsigned) {
+                // 无符号 x % 2^n = x & (2^n-1)：单条 AND，无需除法序列
+                const mask = nt();
+                result.push({ op: IR_OP.MOVI, dst: mask, value: abs - 1 });
+                result.push({ op: IR_OP.AND, dst: inst.dst, a: inst.a, b: mask });
+                continue;
+              }
               // 有符号 x % 2^n：用 x - (x/2^n)*2^n
               const t31 = nt(), s31 = nt(), tbias = nt(), bias = nt(), addv = nt(), sh = nt();
               const q = nt(), qs = nt();
@@ -6469,15 +6624,25 @@ class Optimizer {
       if (inst.dst && typeof inst.dst === 'string' && inst.dst.startsWith('%')) {
         if (!defs.has(inst.dst)) defs.set(inst.dst, inst);
       }
+      if (inst.dstRem && typeof inst.dstRem === 'string' && inst.dstRem.startsWith('%')) {
+        if (!defs.has(inst.dstRem)) defs.set(inst.dstRem, inst);
+      }
     }
     const result = insts.filter(inst => {
+      // DIVMOD 有两个输出 dst(商) 与 dstRem(余)：任一被使用则保留
+      if (inst.op === IR_OP.DIVMOD) {
+        const qUsed = inst.dst && typeof inst.dst === 'string' && inst.dst.startsWith('%') && useCount.has(inst.dst);
+        const rUsed = inst.dstRem && typeof inst.dstRem === 'string' && inst.dstRem.startsWith('%') && useCount.has(inst.dstRem);
+        if (!qUsed && !rUsed) return false;
+        return true;
+      }
       if (inst.dst && typeof inst.dst === 'string' && inst.dst.startsWith('%') && !useCount.has(inst.dst)) {
         // 无副作用的指令可删除
         if (inst.op === IR_OP.MOV || inst.op === IR_OP.MOVI || inst.op === IR_OP.ADD ||
             inst.op === IR_OP.SUB || inst.op === IR_OP.MUL || inst.op === IR_OP.DIV ||
             inst.op === IR_OP.MOD || inst.op === IR_OP.AND || inst.op === IR_OP.OR ||
             inst.op === IR_OP.XOR || inst.op === IR_OP.SHL || inst.op === IR_OP.SHR ||
-            inst.op === IR_OP.LEA || inst.op === IR_OP.CAST) {
+            inst.op === IR_OP.SAR || inst.op === IR_OP.LEA || inst.op === IR_OP.CAST) {
           return false;
         }
       }
@@ -6551,6 +6716,9 @@ class Optimizer {
     //    从不经 main 路径到达，必须保留，否则中断向量表悬空）。
     const reachable = new Set();
     const queue = [entry.name];
+    // 被取地址的函数（可能经函数指针间接调用，如 DrawBuff=UI_LoadBuff）也作为
+    // 可达种子：其函数体及其传递调用链（callees）都必须保留，否则函数指针悬空。
+    for (const fn of addrTaken) queue.push(fn);
     // 收集 interrupt N 处理函数作为不可达入口的种子
     for (const inst of insts) {
       if (inst.op === IR_OP.ENTER && inst.interruptSlot !== undefined && inst.interruptSlot !== null) {
@@ -6596,6 +6764,76 @@ class Optimizer {
   //   * 仅在有符号 / 无符号语义一致（相同 unsigned 标志）时合并，保证 r 语义正确；
   //   * 商 q 必须恰好被定义一次且无其它副作用。
   // ====================================================================
+  // 数字提取 divmod 链（对标 Keil O3 的 __aeabi_uidivmod 串联）
+  //
+  // C 里 `drawseg(n%10000/1000, ...)` 这种"取模结果再被除"的数位提取，
+  // 编译器默认用 magic-number 取模序列 + 软件除法例程，体积大。
+  // 这里识别 `%q = (%a MOD c1) DIV c2`（c1/c2 均为编译期常量）模式，
+  // 把两处都改写为 __udivmod32 调用（一次调用同时返回 商 R0 与 余 R1），
+  // 使每个数位提取从「magic 取模 + 软除」的长序列收敛为两条 divmod 调用。
+  //
+  // 安全规则：
+  //   * 仅当 div 的被除数来自一个 unsigned 常量 MOD 的结果时才改写——unsigned
+  //     mod 的结果恒非负，故对 (被除数)/c2 用无符号除法与有符号除法等价，
+  //     不会因符号位引入语义差异。
+  //   * MOD 的除数与 DIV 的除数都必须是非 0 编译期常量。
+  //   * 被除数在 MOD 与 DIV 之间不得被重定义。
+  // ====================================================================
+  divModChain(insts) {
+    const constVal = new Map(); // temp -> 编译期常量值
+    for (const inst of insts) {
+      if (inst.op === IR_OP.MOVI) constVal.set(inst.dst, inst.value);
+    }
+    const defOf = new Map();
+    for (let i = 0; i < insts.length; i++) {
+      const inst = insts[i];
+      if (inst.dst && typeof inst.dst === 'string' && inst.dst.startsWith('%')) defOf.set(inst.dst, { i, inst });
+    }
+    const rewriteMod = new Map(); // mod 下标 -> { a, c1, r }
+    const rewriteDiv = new Map(); // div 下标 -> { q, x, c2 }
+    for (let i = 0; i < insts.length; i++) {
+      const inst = insts[i];
+      if (inst.op !== IR_OP.DIV) continue;
+      if (typeof inst.b !== 'string' || !constVal.has(inst.b)) continue;
+      const c2 = constVal.get(inst.b);
+      if (c2 === 0) continue;
+      const x = inst.a;
+      const def = x && typeof x === 'string' ? defOf.get(x) : undefined;
+      if (!def || def.inst.op !== IR_OP.MOD) continue;
+      if (typeof def.inst.b !== 'string' || !constVal.has(def.inst.b)) continue;
+      const c1 = constVal.get(def.inst.b);
+      if (c1 === 0) continue;
+      if (!def.inst.unsigned) continue;
+      let redef = false;
+      for (let j = def.i + 1; j < i; j++) {
+        const mid = insts[j];
+        if (mid.dst === x && mid !== def.inst) { redef = true; break; }
+      }
+      if (redef) continue;
+      rewriteDiv.set(i, { q: inst.dst, x, c2, b: inst.b });
+      rewriteMod.set(def.i, { a: def.inst.a, c1, r: x, b: def.inst.b });
+    }
+    if (rewriteDiv.size === 0) return insts;
+    const out = [];
+    for (let i = 0; i < insts.length; i++) {
+      const inst = insts[i];
+      if (rewriteMod.has(i)) {
+        const m = rewriteMod.get(i);
+        const qtmp = `%dm${i}`;
+        out.push({ op: IR_OP.DIVMOD, dst: qtmp, dstRem: m.r, a: m.a, b: m.b, unsigned: true, line: inst.line });
+        continue;
+      }
+      if (rewriteDiv.has(i)) {
+        const d = rewriteDiv.get(i);
+        const rtmp = `%dr${i}`;
+        out.push({ op: IR_OP.DIVMOD, dst: d.q, dstRem: rtmp, a: d.x, b: d.b, unsigned: true, line: inst.line });
+        continue;
+      }
+      out.push(inst);
+    }
+    return out;
+  }
+
   combinedDivMod(insts) {
     // 预先建立 MOVI 常量映射（临时 -> 常量值）
     const constDef = new Map();
@@ -8018,12 +8256,62 @@ class ThumbCodeGen {
     this.gcHome = new Map();
     // 图着色判定为需溢出的临时量集合（无法着色时回退线性扫描 spill 机制）。
     this.gcSpill = new Set();
+    // 大函数中段字面量池冲刷（函数内 LDR = 受 Thumb PC 相对 ±1020 字节限制）：
+    // 当前函数自最近一次冲刷点起已生成的代码字节数（估算）。
+    this._funcCodeBytes = 0;
+    this._inFunc = false;
+    this._poolFlushSeq = 0;
+    // 触发中段冲刷的代码字节阈值（保守，预留 pool 数据对齐余量）。
+    this.POOL_FLUSH_LIMIT = 700;
+    // 参数寄存器（R0-R3）的临时量占用：函数入口参数直接映射到 R0-R3，
+    // 这些寄存器对后续临时量分配应视为“占用”，避免临时量误用参数寄存器
+    // 覆盖仍存活的参数值（如 u8 参数被后续 ALU 临时量覆盖导致值丢失）。
+    this._paramRegs = new Set();
   }
 
   newLabel() { return `.L${this.labelPrefix}${this._labelIdx++}`; }
 
-  asm(line) { this.lines.push(line); }
+  asm(line) {
+    this.lines.push(line);
+    if (this._inFunc) this._countAsmBytes(line);
+  }
   comment(text) { this.lines.push(`\t@ ${text}`); }
+
+  /** 估算一条汇编行的目标机器码字节数，用于驱动大函数中段字面量池冲刷。
+   *  Thumb-1 绝大多数指令为 2 字节，仅 BL/BLX 为 4 字节；.word 数据 4 字节。
+   *  标签/注释/伪指令（.section/.align/.pool）不计。统计偏多只会更早触发冲刷，
+   *  更安全（距离上限 1020 字节）。 */
+  _countAsmBytes(line) {
+    const t = line.trim();
+    if (!t.length) return;
+    if (t.startsWith('@') || t.endsWith(':')) return;          // 注释 / 标签
+    if (t.startsWith('.')) {                                     // 伪指令 / 数据
+      if (t.startsWith('.word') || t.startsWith('.long')) this._funcCodeBytes += 4;
+      return;
+    }
+    if (/^(BL|BLX)\b/.test(t)) this._funcCodeBytes += 4;
+    else this._funcCodeBytes += 2;
+  }
+
+  /** 大函数中段冲刷字面量池：插入「无条件跳转 + .pool + 数字字面量 + 回跳标签」，
+   *  使后续 LDR = 引用的字面量池靠近其指令（受 Thumb PC 相对 ±1020 字节限制）。 */
+  _flushFuncPool() {
+    const seq = ++this._poolFlushSeq;
+    const skipLabel = `.Lpools${this.labelPrefix}${seq}`;
+    this.asm(`\tB ${skipLabel}`);
+    this.asm('\t.pool');
+    this.asm('\t.align 2');
+    if (this.literalPool.length) {
+      for (const lit of this.literalPool) {
+        this.asm(`${lit.label}:`);
+        this.asm(`\t.word ${lit.value}`);
+      }
+      this.literalPool = [];
+      this.literalToLabel.clear();
+    }
+    this.asm(`${skipLabel}:`);
+    this._funcCodeBytes = 0;
+  }
 
   /** 删除紧邻上一条的死移位量装载 `MOV Rt,#imm`。
    *  立即数移位折叠后，被折叠的移位量寄存器不再被读取（死值）。若上一行恰好是
@@ -8079,16 +8367,49 @@ class ThumbCodeGen {
     return this.labelMap.get(irLabel);
   }
 
+  /** 判断 32 位无符号值能否用 Thumb-1 的 MOVS #imm8 + LSL #n 合成（可选 MVN 取反）。
+   * 返回 [imm, n, postOp] 或 null；postOp 为 'MVN' 时表示 val = ~(imm<<n)。 */
+  _trySynthesizeImm(uval) {
+    if (uval <= 255) return [uval, 0, null];
+    for (let n = 1; n < 32; n++) {
+      if ((uval & ((1 << n) - 1)) === 0) {
+        const imm = uval >>> n;
+        if (imm <= 255) return [imm, n, null];
+      }
+    }
+    const inv = (~uval) >>> 0;
+    for (let n = 1; n < 32; n++) {
+      if ((inv & ((1 << n) - 1)) === 0) {
+        const imm = inv >>> n;
+        if (imm <= 255) return [imm, n, 'MVN'];
+      }
+    }
+    return null;
+  }
+
   /** 常量立即数加载（MOV 或 LDR =literal） */
   emitLoadConst(reg, val) {
     val = val | 0;
     if (val >= 0 && val <= 255) {
       this.asm(`\tMOV ${reg}, #${val}`);
-    } else if (val === -1) {
+      return;
+    }
+    if (val === -1) {
       // Thumb-1 无 MVN #imm：用 MOV #0 + MVN Rd,Rd 合成 -1
       this.asm(`\tMOV ${reg}, #0`);
       this.asm(`\tMVN ${reg}, ${reg}`);
-    } else {
+      return;
+    }
+    // Thumb-1 无 MOVW/MOVT：尝试 MOVS #imm8 + LSL #n（或 + MVN）就地合成
+    const synth = this._trySynthesizeImm(val >>> 0);
+    if (synth) {
+      const imm = synth[0], n = synth[1], post = synth[2];
+      this.asm(`\tMOV ${reg}, #${imm}`);
+      if (n > 0) this.asm(`\tLSL ${reg}, ${reg}, #${n}`);
+      if (post) this.asm(`\t${post} ${reg}, ${reg}`);
+      return;
+    }
+    {
       // 放入字面量池
       const key = val >>> 0;
       let lbl = this.literalToLabel.get(key);
@@ -8139,6 +8460,7 @@ class ThumbCodeGen {
   /** 判断寄存器 reg 是否已被任一活跃临时量占用（含实参忙寄存器）。 */
   _regInUse(reg) {
     if (this._argBusyRegs.has(reg)) return true;
+    if (this._paramRegs.has(reg)) return true;
     for (const r of this.regAlloc.values()) {
       if (r === reg) return true;
     }
@@ -8153,6 +8475,7 @@ class ThumbCodeGen {
     const pool = needCalleeSaved ? CALLEE_SAVED : REGS;
     const used = new Set(this.regAlloc.values());
     for (const r of this._argBusyRegs) used.add(r); // 实参寄存器占用中，不可复用
+    for (const r of this._paramRegs) used.add(r);   // 函数参数寄存器占用，不可复用
     for (const r of pool) {
       if (!used.has(r)) return r;
     }
@@ -8200,8 +8523,21 @@ class ThumbCodeGen {
     };
     for (const [t, r] of this.regAlloc) consider(t, r);
     if (best === null) {
-      // 所有可用寄存器都被当前指令操作数占用，理论上不会发生（操作数本就已占寄存器）；
-      // 兜底用 R6（被调用方保护，函数入口已 PUSH 保存）。
+      // R6 兜底：R6 是专用 scratch（u8/u16 CAST 截断、溢出地址合成等都会占用 R6）。
+      // 若 R6 已被某活跃临时量占用，必须先将其溢出（写回溢出槽），否则该临时量驻留 R6
+      // 会被后续 R6-scratch 操作覆盖（如 initmem 中 .g3 基址驻留 R6 后被 u8 自增的
+      // `LSL R6,#24; LSR R6,#24` 踩死）。spill/reload 保证跨迭代语义正确。
+      const r6holder = [...this.regAlloc].find(([, r]) => r === 'R6');
+      if (r6holder) {
+        const vt = r6holder[0];
+        let off = this.spillSlots.get(vt);
+        if (off === undefined) {
+          off = this._allocSpillSlot(vt);
+          this.spillSlots.set(vt, off);
+        }
+        this._emitSpillStore('R6', off);
+        this.regAlloc.delete(vt);
+      }
       return 'R6';
     }
     const [vt, vr] = best;
@@ -8214,6 +8550,36 @@ class ThumbCodeGen {
     this._emitSpillStore(vr, off);
     this.regAlloc.delete(vt);
     return vr;
+  }
+
+  /**
+   * 在函数调用点（BL/BLX）之前调用：把「仍存活但驻留在 caller-saved 寄存器
+   * （R0-R3、R6）的临时量」安全化。函数调用会破坏 caller-saved 寄存器，若某跨调用
+   * 存活临时量（如数字提取 divmod 链中多次作为被除数的基址/被除数）此刻被线性扫描
+   * 放在 R0-R3，调用返回后其寄存器值已丢失，而 regAlloc 仍保留「temp→R0」的陈旧映射，
+   * 下一次使用会直接复用该脏寄存器（不重载），读到被调用方覆盖的错误值——这正是
+   * divmod 多级链（5 位数提取）结果错误的根因。
+   *
+   * 处理：为每个仍存活（lastUse > curIndex）的 caller-saved 驻留临时量：
+   *   * 若已有溢出槽 → 其真实值已在槽中，只需从 regAlloc 移除映射，下次使用从槽重载；
+   *   * 若无溢出槽 → 值只在寄存器中，必须先写回新溢出槽再移除映射（否则调用覆盖后丢失）。
+   * 一律在调用前执行，保证调用后该临时量必然可从溢出槽重载到正确值。
+   */
+  _callClobberCallerSaved() {
+    for (const [temp, reg] of [...this.regAlloc]) {
+      // R4/R5 为 callee-saved，被调用方负责保存，跨调用安全，无需处理。
+      if (CALLEE_SAVED.includes(reg)) continue;
+      if (reg === 'R7') continue; // 帧指针不存临时量
+      const lu = this.lastUse.get(temp);
+      if (lu == null || lu <= this.curIndex) continue; // 已死，调用覆盖无影响
+      // 该临时量在调用后仍存活：确保其值落在溢出槽，并从 regAlloc 摘除（下次重载）。
+      if (!this.spillSlots.has(temp)) {
+        const off = this._allocSpillSlot(temp);
+        this.spillSlots.set(temp, off);
+        this._emitSpillStore(reg, off);
+      }
+      this.regAlloc.delete(temp);
+    }
   }
 
   /** 把寄存器值 store 到溢出槽（相对帧指针 R7 的【正偏移】，单条 STR 指令）。 */
@@ -8289,7 +8655,8 @@ class ThumbCodeGen {
       const inst = bodyInsts[k];
       const gi = globalStartIdx + k;
       if (inst.op === IR_OP.CALL || inst.op === IR_OP.SYS
-          || inst.op === IR_OP.DIV || inst.op === IR_OP.MOD || inst.op === IR_OP.UMULHI) {
+          || inst.op === IR_OP.DIV || inst.op === IR_OP.MOD || inst.op === IR_OP.UMULHI
+          || inst.op === IR_OP.DIVMOD) {
         callPos.add(gi);
       }
       // 定义点：dst（store 的 dst 是地址使用，不算定义）
@@ -8327,7 +8694,14 @@ class ThumbCodeGen {
     for (const [temp, def] of defPos) {
       const lu = lastUse.get(temp);
       if (lu == null || lu <= def) continue; // 无实际使用区间
-      const start = def, end = lu;
+      // 活区间 end：优先采用 _extendLoopCarried 扩展后的 this.lastUse（把跨回边存活
+      // 的循环携带变量延伸到函数末尾）。若只按本地线性 lastUse，循环携带变量（如
+      // 主循环里跨迭代存活的局部变量）的活区间会被低估到本迭代最后一线使用处，从而
+      // 与后续循环体内复用同一寄存器的临时量不产生干涉，错误共享寄存器 → 下一次迭代
+      // 读到被覆盖的脏值（实机表现为变量值异常/死循环/跑飞）。
+      const ext = this.lastUse && this.lastUse.get(temp);
+      const end = (ext != null && ext > lu) ? ext : lu;
+      const start = def;
       // 跨调用存活：优先采用 _computeCrossCallTemps 的结果（其 lastUse 已被
       // _extendLoopCarried 对循环携带变量扩展到函数末尾，能正确识别「在循环体内
       // 跨 CALL 存活」的临时量，例如 DrawBuff 中 xsize/ysize 这类循环上限变量）。
@@ -8362,7 +8736,7 @@ class ThumbCodeGen {
     const colorOf = new Array(nodes.length).fill(-1);
     for (const i of order) {
       const used = new Set();
-      for (const j of adj[i]) if (colorOf[j] >= 0) used.add(colorOf[j]);
+      for (const j of adj[i]) if (colorOf[j] !== -1) used.add(colorOf[j]);
       for (const reg of nodes[i].palette) {
         if (!used.has(reg)) { colorOf[i] = reg; break; }
       }
@@ -8492,6 +8866,10 @@ class ThumbCodeGen {
       this._emitSrcMarker(inst);
       this.genInst(inst);
       this._releaseRegs();
+      // 大函数中段冲刷字面量池，避免 LDR = 超 Thumb PC 相对 ±1020 字节范围
+      if (this._inFunc && this._funcCodeBytes >= this.POOL_FLUSH_LIMIT) {
+        this._flushFuncPool();
+      }
     }
     // 追加字面量池（模块末尾兜底）
     this.asm('\t.pool');
@@ -8800,6 +9178,38 @@ class ThumbCodeGen {
       }
     }
 
+    // ---- P12: 消除同基本块内同一符号的重复地址加载
+    //            `LDR Rd, =sym` 之后，若同基本块内再次 `LDR Rd, =sym` 且中间没有
+    //            重新定义 Rd、没有调用（调用可能覆盖 caller-saved Rd），则第二次
+    //            LDR 冗余（Rd 仍持有同一地址），删除之。显著缩减基址合成体积。
+    if (a.op === "LDR" && a.ops.length === 2 && /^=\./.test(a.ops[1])) {
+      const rd = this._peepReg(a.ops[0]);
+      const sym = a.ops[1];
+      if (rd !== null) {
+        // 向后找同 Rd、同 sym 的后续 LDR=；中间无改写 Rd、无调用则删除后者
+        for (let j = i + 1; j < lines.length; j++) {
+          const t = typeof lines[j] === "string" ? lines[j].trim() : "";
+          if (t.length === 0 || t.startsWith("@")) continue;
+          // 基本块边界：label / 无条件跳 / 返回 / 数据段 → 停止
+          if (t.endsWith(":") || /^B\s/.test(t) || t === "BX LR" || t.startsWith(".")) break;
+          // 调用会覆盖 caller-saved（R0-R3/R6），callee-saved（R4,R5,R7）不受影响
+          if (/^BL(?:X)?\s/.test(t) || /^SWI\s/.test(t)) {
+            if (rd < 4 || rd === 6) break;
+            continue;
+          }
+          const jp = this._peepDefUse(t);
+          if (!jp || !jp.op) continue;
+          // 命中同 Rd、同 sym 的 LDR=
+          if (jp.op === "LDR" && jp.ops.length === 2 && jp.ops[1] === sym
+              && this._peepReg(jp.ops[0]) === rd) {
+            lines[j] = "";
+            return true;
+          }
+          // 中间有指令定义了 Rd → 地址被破坏，停止
+          if (jp.defs.has(rd)) break;
+        }
+      }
+    }
     // ---- P1/P2: MOV Rd, Rb + ADD/SUB Rd, #off + LDR/STR Rt, [Rd, #0]
     //             => LDR/STR Rt, [Rb, #+off]（正偏移且落在立即数访存范围）
     if (a.op === 'MOV' && a.ops.length === 2) {
@@ -8894,6 +9304,38 @@ class ThumbCodeGen {
       }
     }
 
+    // ---- P11: MOV Rd, #imm; MOV Rt, Rd => MOV Rt, #imm
+    //           寄存器分配器有时把常量先放进 Rd 再拷贝到 Rt（如 s8 符号扩展后
+    //           传给目标寄存器）。当 Rd 在该拷贝后不再被读时，可把常量直接发到 Rt，
+    //           省掉一条 MOV（Keil 也这样直接给目标寄存器赋常量）。
+    if (a.op === 'MOV' && a.ops.length === 2) {
+      const rd = this._peepReg(a.ops[0]);
+      const imm = this._peepImm(a.ops[1]);
+      const nxt = i + 1 < lines.length ? this._peepParse(lines[i + 1]) : null;
+      if (rd !== null && imm !== null && nxt && nxt.op === 'MOV' && nxt.ops.length === 2) {
+        const rt = this._peepReg(nxt.ops[0]);
+        const rs2 = this._peepReg(nxt.ops[1]);
+        if (rt !== null && rs2 === rd && rt !== rd) {
+          // 确认 Rd 在整个剩余函数体里都不再被读（跨分支也须满足），才可安全消除。
+          let dead = true;
+          for (let j = i + 2; j < lines.length; j++) {
+            const t = typeof lines[j] === 'string' ? lines[j].trim() : '';
+            if (t.length === 0 || t.startsWith('@')) continue;
+            // 到达下一个函数标签：视为作用域结束
+            if (t.endsWith(':') && !t.startsWith('.')) break;
+            if (t.startsWith('.')) continue;
+            const re = new RegExp(`(?:^|[^A-Za-z0-9])R${rd}(?=[, \]}]|$)`);
+            if (re.test(t)) { dead = false; break; }
+          }
+          if (dead) {
+            lines[i + 1] = `\tMOV R${rt}, #${imm}`;
+            lines[i] = '';
+            return true;
+          }
+        }
+      }
+    }
+
     // ---- P9: ADD/SUB Rd, Rb, #off + LDR/STR Rt, [Rd, #0] => LDR/STR Rt, [Rb, #±off]
     //          （正偏移可折进 Thumb 立即数访存；负偏移不可折，保持原样）
     if ((a.op === 'ADD' || a.op === 'SUB') && a.ops.length === 3) {
@@ -8949,6 +9391,8 @@ class ThumbCodeGen {
 
     // ---- P7: LSL Rd,Rd,#16; ASR Rd,Rd,#16 => SXTH Rd,Rd
     //          LSL Rd,Rd,#24; ASR Rd,Rd,#24 => SXTB Rd,Rd（符号扩展指令 1 条替代 2 条）
+    //          零扩展（u8/u16 截断）：LSL Rd,Rd,#24; LSR Rd,Rd,#24 => UXTB Rd,Rd
+    //          LSL Rd,Rd,#16; LSR Rd,Rd,#16 => UXTH Rd,Rd（1 条替代 2 条，减小 ROM）
     if ((a.op === 'LSL' || a.op === 'LSR') && a.ops.length === 3) {
       const b = i + 1 < lines.length ? this._peepParse(lines[i + 1]) : null;
       const r0 = this._peepReg(a.ops[0]);
@@ -8970,6 +9414,39 @@ class ThumbCodeGen {
             lines[i] = '';
             return true;
           }
+          // 零扩展：LSL #16; LSR #16 => UXTH（逻辑右移=无符号截断）
+          if (a.op === 'LSL' && b.op === 'LSR' && imm === 16) {
+            lines[i + 1] = `\tUXTH R${r0}, R${r0}`;
+            lines[i] = '';
+            return true;
+          }
+          // 零扩展：LSL #24; LSR #24 => UXTB（u8 循环变量截断常用）
+          if (a.op === 'LSL' && b.op === 'LSR' && imm === 24) {
+            lines[i + 1] = `\tUXTB R${r0}, R${r0}`;
+            lines[i] = '';
+            return true;
+          }
+        }
+      }
+    }
+
+    // ---- P7b: LSL Rd,Rs,#24; LSR Rd,Rd,#24 => UXTB Rd,Rs
+    //           LSL Rd,Rs,#16; LSR Rd,Rd,#16 => UXTH Rd,Rs
+    //           （零扩展截断，源 Rs 与目标 Rd 不同寄存器。中间 Rd=Rs<<24 的值随后被
+    //            逻辑右移覆盖为 Rs&0xFF，合并为单条 UXTB/UXTH，省一条指令。）
+    if (a.op === 'LSL' && a.ops.length === 3) {
+      const b = i + 1 < lines.length ? this._peepParse(lines[i + 1]) : null;
+      const rd = this._peepReg(a.ops[0]);
+      const rs = this._peepReg(a.ops[1]);
+      const imm = this._peepImm(a.ops[2]);
+      if (rd !== null && rs !== null && rd !== rs && imm !== null && b
+          && b.op === 'LSR' && b.ops.length === 3) {
+        const brd = this._peepReg(b.ops[0]);
+        const brs = this._peepReg(b.ops[1]);
+        const bimm = this._peepImm(b.ops[2]);
+        if (brd === rd && brs === rd && bimm === imm) {
+          if (imm === 24) { lines[i + 1] = `\tUXTB R${rd}, R${rs}`; lines[i] = ''; return true; }
+          if (imm === 16) { lines[i + 1] = `\tUXTH R${rd}, R${rs}`; lines[i] = ''; return true; }
         }
       }
     }
@@ -9332,7 +9809,7 @@ class ThumbCodeGen {
       // 因此与之等同的函数调用点，跨它存活的临时量须用 callee-saved 寄存器。
       if (inst.op === IR_OP.CALL || inst.op === IR_OP.SYS
           || inst.op === IR_OP.DIV || inst.op === IR_OP.MOD
-          || inst.op === IR_OP.UMULHI) callPos.add(i);
+          || inst.op === IR_OP.UMULHI || inst.op === IR_OP.DIVMOD) callPos.add(i);
       // 定义点：dst（被写入的临时量），store 的 dst 是地址(使用)不算定义
       const dst = inst.dst;
       if (dst && typeof dst === 'string' && dst.startsWith('%') && inst.op !== IR_OP.STORE
@@ -9411,7 +9888,7 @@ class ThumbCodeGen {
       const op = insts[j].op;
       if (op === IR_OP.CALL || op === IR_OP.SYS) hasCall = true;
       if (op === IR_OP.ARGP) hasArgp = true;
-      if (op === IR_OP.DIV || op === IR_OP.MOD || op === IR_OP.UMULHI) {
+      if (op === IR_OP.DIV || op === IR_OP.MOD || op === IR_OP.UMULHI || op === IR_OP.DIVMOD) {
         hasDiv = true;
         hasCall = true;
       }
@@ -9485,32 +9962,13 @@ class ThumbCodeGen {
       }
     }
     const needR45 = hasCrossCall || maxLiveTemps > 4 || gcUsesR45;
-    if (needR45) {
-      pushRegs.add('R4');
-      pushRegs.add('R5');
-    }
-
-    // R6：DIV/MOD/UMULHI 需要 scratch（内部调用软除法例程需临时中转），
-    // 溢出时使用 R6 作为 scratch（活跃临时量 > 7 时 R0-R5 不足），
-    // 或 ARGP 在函数入口用 R6 存入寄存器参数（需保护 R6）
-    if (hasDiv || hasArgp || maxLiveTemps >= 8) {
-      pushRegs.add('R6');
-    }
-
-    // LR：函数有调用时需要
-    if (hasCall) needLR = true;
-
-    // 溢出槽预算：预测本函数是否会溢出、需要多少个溢出槽。
-    // 有调用（CALL/SYS/DIV/MOD）且活跃临时量超过可用寄存器（R0-R5，6 个）时，
-    // 极可能发生寄存器耗尽而溢出。溢出槽数受活跃临时量上界限制（每个临时量至多
-    // 占一个溢出槽，活跃临时量总数 ≤ maxLiveTemps），故以 maxLiveTemps 为槽数上限，
-    // 保证预分配足够且不会越界。
-    // 溢出槽预算：以图着色分配器的溢出判定（gcSpill）为准。
-    // 图着色精确给出哪些临时量无法着色而需溢出，其数量即本函数实际需要的溢出槽数，
-    // 相比旧的 maxLiveTemps 保守启发（有调用即按活跃量上界预留），用 gcSpill.size
-    // 可避免对实际不溢出的函数多预留栈帧与序言/收尾指令（SUB SP,#N / MOV R7,SP /
-    // MOV SP,R7 / ADD SP,#N），显著缩小 ROM。
-    // 注意：图着色已运行（ENTER 中先 _graphColorAlloc 再 _scanFunctionRegs）。
+    // 线性扫描模拟（_countSpillSlots）能如实反映运行时分配器实际用到的物理寄存器：
+    // 即使图着色 gcHome 与 maxLiveTemps 都没触发，函数若存在「实参占满 R0-R3 后临时量
+    // 被迫用 R4/R5 中转」（如多参数函数内为调用点暂存实参）或「跨调用临时量驻留 R4/R5」，
+    // 都会在模拟中落到 R4/R5。此时序言必须保存 R4/R5，否则返回时破坏调用方同名寄存器
+    // （实机表现为调用者局部变量/返回值被踩、sw 等 callee-saved 驻留变量值异常）。
+    // 溢出槽预算：以图着色分配器的溢出判定（gcSpill）为准，再叠加一次真实线性扫描模拟
+    // （_countSpillSlots，同时记录模拟实际用到的 R4/R5）作为兜底精确预算。
     let spillSlots = (this.gcSpill && this.gcSpill.size) || 0;
     // 兜底：图着色对「无调用高压力函数」可能低估其点态寄存器压力（区间染色比点态
     // 分配更宽松，如 initmem 在点态需溢出 1 个临时而染色认为无需溢出）。此时预留
@@ -9528,6 +9986,25 @@ class ThumbCodeGen {
     // 冲突等），对已判定会溢出的函数加少量余量，吸收细微低估，保证 _allocSpillSlot
     // 永不越界、永不触发内联 SUB SP。无溢出函数（模拟=0）不加余量，保持 ROM 紧凑。
     if (spillSlots > 0) spillSlots += 2;
+    const simUsesR45 = this._simUsedRegs && (this._simUsedRegs.has('R4') || this._simUsedRegs.has('R5'));
+    if (needR45 || simUsesR45) {
+      pushRegs.add('R4');
+      pushRegs.add('R5');
+    }
+
+    // R6：DIV/MOD/UMULHI 需要 scratch（内部调用软除法例程需临时中转），
+    // 溢出时使用 R6 作为 scratch（活跃临时量 > 7 时 R0-R5 不足），
+    // 或 ARGP 在函数入口用 R6 存入寄存器参数（需保护 R6）。
+    // 当活跃临时量达到 R0-R5 数量（6）时，分配器可能兜底使用 R6 作 scratch，
+    // 因此一旦 maxLiveTemps >= 6 就必须保存 R6（否则破坏调用方的 R6，
+    // 如调用方把 R6 用作循环变量时会因被篡改而死循环）。
+    if (hasDiv || hasArgp || maxLiveTemps >= 6) {
+      pushRegs.add('R6');
+    }
+
+    // LR：函数有调用时需要
+    if (hasCall) needLR = true;
+
     return { pushRegs, needLR, spillSlots };
   }
 
@@ -9545,9 +10022,22 @@ class ThumbCodeGen {
     const busyArgRegs = new Set(); // R0-R3 实参寄存器占用（areg 设置到 CALL 前）
     const argLive = new Set();    // 实参临时量存活到 CALL，不可溢出
     const spilled = new Set();    // distinct spilled temps（溢出槽数）
+    this._simUsedRegs = new Set(); // 线性扫描模拟中实际用到的物理寄存器（含 R4/R5）
+    // 函数自身的寄存器参数（R0-R3）在本函数内始终保留给参数临时量，不能复用给
+    // 其它临时量（与 ENTER 的 _paramRegs 逻辑一致）。若不建模，模拟会比真实分配器
+    // 多出 R0-R3 可用，严重低估实际溢出槽数（如 setaddress 的 x/y 参数占用 R0/R1
+    // 后，除法序列寄存器吃紧被迫溢出，但模拟误以为 R0/R1 空闲而不溢出）。
+    const paramRegs = new Set();
+    for (const bi of bodyInsts) {
+      if (bi.op === IR_OP.MOV && typeof bi.src === 'string' && /^R[0-3]$/.test(bi.src)
+          && typeof bi.dst === 'string' && bi.dst.startsWith('%')) {
+        paramRegs.add(bi.src);
+        regUsed.add(bi.src);
+      }
+    }
     const isStore = (op) => op === IR_OP.STORE || op === IR_OP.STOREB || op === IR_OP.STOREH;
     const isCallOp = (op) => op === IR_OP.CALL || op === IR_OP.SYS
-      || op === IR_OP.DIV || op === IR_OP.MOD || op === IR_OP.UMULHI;
+      || op === IR_OP.DIV || op === IR_OP.MOD || op === IR_OP.UMULHI || op === IR_OP.DIVMOD;
     // 释放已死临时量（与 _releaseRegs 一致：lastUse < 当前指令全局下标即释放）
     const freeDead = (gi) => {
       for (const [t, r] of [...regAlloc]) {
@@ -9564,7 +10054,30 @@ class ThumbCodeGen {
       }
       if (inst.op === IR_OP.AREG && inst.v && typeof inst.v === 'string') {
         argLive.add(inst.v);
-        busyArgRegs.add(`R${inst.idx}`);
+        const argReg = `R${inst.idx}`;
+        busyArgRegs.add(argReg);
+        // 模拟真实 genInst 的 AREG 搬移：实参临时量 v 若未驻留在 argReg，则需先
+        // 暂存到另一个寄存器再 MOV 到 argReg；当 R0-R3 被其他活值/参数占满时，这个
+        // 暂存寄存器会落到 callee-saved R4/R5（如 HW_DrawBuff 的 setaddress 实参）。
+        // 若序言未保存 R4/R5，被调用方返回后调用者的 R4/R5 会被破坏。
+        if (regAlloc.has(inst.v) && regAlloc.get(inst.v) !== argReg) {
+          const rs = regAlloc.get(inst.v);
+          // v 的暂存寄存器选择：优先 R0-R5 中非 argReg、非 busyArg、非正在用的空闲位
+          const usedNow = new Set(regAlloc.values());
+          for (const b of busyArgRegs) usedNow.add(b);
+          for (const b of paramRegs) usedNow.add(b);
+          let tmp = null;
+          for (const fr of ['R4', 'R5', 'R0', 'R1', 'R2', 'R3']) {
+            if (fr !== argReg && !usedNow.has(fr)) { tmp = fr; break; }
+          }
+          if (tmp !== null && tmp !== rs) {
+            // 把 v 从 rs 搬到 tmp（模拟 MOV tmp, rs），并释放 rs 给其他使用
+            regAlloc.set(inst.v, tmp);
+            regUsed.delete(rs);
+            regUsed.add(tmp);
+            this._simUsedRegs && this._simUsedRegs.add(tmp);
+          }
+        }
       }
       freeDead(gi);
       // 本指令需要寄存器的临时量：先操作数（src/a/b/v/fn），后目标（dst）。
@@ -9618,6 +10131,7 @@ class ThumbCodeGen {
         }
         regAlloc.set(t, reg);
         regUsed.add(reg);
+        this._simUsedRegs.add(reg);
       }
     }
     return spilled.size;
@@ -9675,9 +10189,12 @@ class ThumbCodeGen {
   /** 输出单个全局数据标签 + 初始化字节/占位 */
   emitGlobalData(g, section) {
     this.dataLines.push(`\t.global ${g.name}`);
-    this.dataLines.push(`${g.label}:`);
-    // 对齐
+    // 对齐必须在标签之前：保证标签指向对齐后的实际数据地址。
+    // 若 `.align 2` 放在标签之后，则数据( .space/.word )被对齐到 4 字节边界，
+    // 而标签仍指向未对齐的前一地址——全局变量符号地址因此非对齐
+    // （如 u32 maincount 落到 0x20000456），实机 Cortex-M0 做 32 位读写时直接 HardFault/跑飞。
     if (g.align >= 4) this.dataLines.push('\t.align 2');
+    this.dataLines.push(`${g.label}:`);
     if (g.initBytes && !this._isZeroInit(g)) {
       // 符号引用（如 &global）：写为 .word <label>，交由汇编/链接解析绝对地址
       const refs = g.initRefs || [];
@@ -9749,6 +10266,9 @@ class ThumbCodeGen {
       }
       case IR_OP.ENTER: {
         this.currentFunc = inst.fnName;
+        // 新函数开始：重置中段池冲刷计数
+        this._inFunc = true;
+        this._funcCodeBytes = 0;
         // 中断向量：记录 { 槽位号 -> 函数名 }，供 Linker 回填 VEC 表
         if (inst.interruptSlot !== undefined && inst.interruptSlot !== null) {
           this.interruptSlots.set(inst.interruptSlot, inst.fnName);
@@ -9766,6 +10286,16 @@ class ThumbCodeGen {
         this._graphColorAlloc(bodyInsts, this.curIndex + 1);
         // 扫描本函数 IR 确定需要保存的 callee-saved 寄存器与是否需保存 LR
         const { pushRegs, needLR, spillSlots } = this._scanFunctionRegs(this._allInsts, this.curIndex);
+        // 预映射寄存器参数（MOV %loc_xxx = R{idx}）：在函数入口把参数临时量映射到
+        // R0-R3 并标记这些寄存器为参数占用，使后续临时量分配避开，避免覆盖参数值。
+        this._paramRegs.clear();
+        for (const bi of bodyInsts) {
+          if (bi.op === IR_OP.MOV && typeof bi.src === 'string' && /^R[0-3]$/.test(bi.src)
+              && typeof bi.dst === 'string' && bi.dst.startsWith('%')) {
+            this.regAlloc.set(bi.dst, bi.src);
+            this._paramRegs.add(bi.src);
+          }
+        }
         // 帧指针消除：若本函数无栈帧（无局部/溢出区）且不访问任何栈上对象
         // （无 LEA SP），则 R7 无需作为帧指针建立与保存，从保存寄存器集合中剔除。
         let frameNeedsR7 = (Math.abs(inst.localsSize) || 0) + (spillSlots || 0) > 0;
@@ -9881,10 +10411,28 @@ class ThumbCodeGen {
         if ((inst.op === IR_OP.SHL || inst.op === IR_OP.SHR || inst.op === IR_OP.SAR)
             && typeof inst.a === 'string' && typeof constB === 'number'
             && constB >= 0 && constB <= 31) {
-          const rd = this.allocReg(inst.dst);
-          const rs = this.allocReg(inst.a);
           const op = OP_TO_THUMB[inst.op];
-          // Thumb 立即数移位：LSL/LSR/ASR Rd, Rs, #imm（Rd 可与 Rs 不同）
+          // 复用优化：若第一操作数 inst.a 在本移位后即死（lastUse<=curIndex），直接复用其
+          // 寄存器作为结果寄存器，用单条 `LSL/LSR/ASR Rd,Rd,#imm` 即可，既省一条 MOV，
+          // 又避免在寄存器吃紧时先 allocReg(dst)（可能溢出 src）再 allocReg(src)（又被迫
+          // 溢出 dst 写陈旧值）导致的 spill 往返。
+          const aDead = typeof inst.a === 'string' && inst.a.startsWith('%')
+            && (this.lastUse.get(inst.a) ?? -1) <= this.curIndex
+            && !this._argLiveTemps.has(inst.a) && this.regAlloc.has(inst.a);
+          let rd, rs;
+          if (aDead) {
+            rs = this.allocReg(inst.a);
+            rd = rs; // 直接复用源寄存器，src 死后无风险
+            this.regAlloc.set(inst.dst, rs);
+          } else {
+            // 源可能已溢出：先分配源（重载到寄存器），再分配目标。若目标随后被迫
+            // 溢出源，源此时有合法值（刚重载或本就驻留），写回溢出槽是安全的；
+            // 反之若先分配目标再重载源，目标（尚未计算的 dst）会被 R6 兑底溢出
+            // 写入陈旧值，导致后续 reload dst 读到错误结果（如二分查找的 mid）。
+            rs = this.allocReg(inst.a);
+            rd = this.allocReg(inst.dst);
+          }
+          // Thumb 立即数移位：LSL/LSR/ASR Rd, Rs, #imm（Rd 可与 Rs 相同）
           this.asm(`\t${op} ${rd}, ${rs}, #${constB}`);
           // 消除死移位量装载：若上一行是 `MOV Rt,#imm`（相同立即数）且本移位不使用
           // Rt（立即数折叠后移位量寄存器成死值），则删掉该 MOV。
@@ -9899,12 +10447,22 @@ class ThumbCodeGen {
         // 这样 `dst = a OP b` 在 Thumb-1 下用单条 `OP rs, rt` 即可，消除大量冗余 MOV。
         const aDead = typeof inst.a === 'string' && inst.a.startsWith('%')
           && (this.lastUse.get(inst.a) ?? -1) <= this.curIndex
-          && !this._argLiveTemps.has(inst.a) && this.regAlloc.has(inst.a);
+          && !this._argLiveTemps.has(inst.a) && this.regAlloc.has(inst.a)
+          // 若结果 dst 需跨调用存活（须用 callee-saved 寄存器），而复用的源寄存器
+          // 是 caller-saved（R0-R3），则不能复用——否则 dst 会落在 caller-saved 上，
+          // 后续 CALL/DIV/MOD/DIVMOD 会覆盖它。必须为 dst 重新分配 callee-saved 寄存器。
+          && !(this.crossCallTemps.has(inst.dst) && !CALLEE_SAVED.includes(rs));
         let rd;
         if (aDead) {
           // 复用已死操作数 a 的寄存器作为结果寄存器，安全（a 此后不再被使用）。
-          rd = rs;
-          this.regAlloc.set(inst.dst, rs);
+          // 但若第二操作数 b 恰好也占用 rs（两操作数同寄存器，如 a 的值被 b 依赖），
+          // 则不能复用（否则 `dst = a OP b` 会退化成 `rd = rd OP rd` 丢失 b）。
+          if (rs === rt) {
+            rd = this.allocReg(inst.dst);
+          } else {
+            rd = rs;
+            this.regAlloc.set(inst.dst, rs);
+          }
         } else {
           rd = this.allocReg(inst.dst);
         }
@@ -9943,26 +10501,90 @@ class ThumbCodeGen {
         const busy = new Set([rs, rt, 'R0', 'R1']);
         let scr = 'R3';
         for (const r of ['R3', 'R2', 'R4']) { if (!busy.has(r)) { scr = r; break; } }
-        if (rt === 'R0') {
-          this.asm(`\tMOV ${scr}, R0`);   // 保存除数
-        }
-        if (rs === 'R1') {
-          this.asm(`\tMOV R0, R1`);
-        } else if (rs !== 'R0') {
-          this.asm(`\tMOV R0, ${rs}`);
-        }
-        if (rt === 'R0') {
-          this.asm(`\tMOV R1, ${scr}`);
-        } else if (rt !== 'R1') {
-          this.asm(`\tMOV R1, ${rt}`);
+        // 冲突修复：被除数在分配除数时被 spill 且与除数共寄存器（rs===rt 且被除数
+        // 已进 spill 槽）时，需先从溢出槽重载被除数，避免 R0/R1 都读到除数值。
+        if (rs === rt && this.spillSlots.has(inst.a)) {
+          if (rt === 'R0') {
+            this.asm(`\tMOV R1, R0`);   // 除数移到 R1
+            this._emitReload('R0', this.spillSlots.get(inst.a)); // 重载被除数到 R0
+          } else {
+            if (rt !== 'R1') this.asm(`\tMOV R1, ${rt}`); // 除数到 R1
+            this._emitReload('R0', this.spillSlots.get(inst.a)); // 重载被除数到 R0
+          }
+        } else {
+          if (rt === 'R0') {
+            this.asm(`\tMOV ${scr}, R0`);   // 保存除数
+          }
+          if (rs === 'R1') {
+            this.asm(`\tMOV R0, R1`);
+          } else if (rs !== 'R0') {
+            this.asm(`\tMOV R0, ${rs}`);
+          }
+          if (rt === 'R0') {
+            this.asm(`\tMOV R1, ${scr}`);
+          } else if (rt !== 'R1') {
+            this.asm(`\tMOV R1, ${rt}`);
+          }
         }
         const divFn = inst.unsigned
           ? (inst.op === IR_OP.DIV ? '__udiv32' : '__umod32')
           : (inst.op === IR_OP.DIV ? '__sdiv32' : '__smod32');
         this.usedRuntime.add(divFn);
+        this._callClobberCallerSaved();
         this.asm(`\tBL ${divFn}`);
         const rd = this.allocReg(inst.dst);
         this.asm(`\tMOV ${rd}, R0`);
+        break;
+      }
+      case IR_OP.DIVMOD: {
+        // 无符号 32x32 同时返回 商(R0) 与 余(R1)：调用 __udivmod32
+        const rs = this.allocReg(inst.a);
+        const rt = this.allocReg(inst.b);
+        const busy = new Set([rs, rt, 'R0', 'R1']);
+        let scr = 'R3';
+        for (const r of ['R3', 'R2', 'R4']) { if (!busy.has(r)) { scr = r; break; } }
+        if (rs === rt && this.spillSlots.has(inst.a)) {
+          if (rt === 'R0') { this.asm(`\tMOV R1, R0`); this._emitReload('R0', this.spillSlots.get(inst.a)); }
+          else { if (rt !== 'R1') this.asm(`\tMOV R1, ${rt}`); this._emitReload('R0', this.spillSlots.get(inst.a)); }
+        } else {
+          if (rt === 'R0') this.asm(`\tMOV ${scr}, R0`);
+          if (rs === 'R1') this.asm(`\tMOV R0, R1`);
+          else if (rs !== 'R0') this.asm(`\tMOV R0, ${rs}`);
+          if (rt === 'R0') this.asm(`\tMOV R1, ${scr}`);
+          else if (rt !== 'R1') this.asm(`\tMOV R1, ${rt}`);
+        }
+        this.usedRuntime.add('__udivmod32');
+        this._callClobberCallerSaved();
+        this.asm(`\tBL __udivmod32`);
+        // __udivmod32 返回 R0=商, R1=余。为 dst(商)/dstRem(余) 分配目标寄存器。
+        const rq = inst.dst ? this.allocReg(inst.dst) : null;
+        const rr = inst.dstRem ? this.allocReg(inst.dstRem) : null;
+        // 交叉冲突处理：
+        //   * 商要存 R1 时，`MOV R1,R0` 会覆盖尚未搬走的余数 R1 → 需先暂存余
+        //   * 余要存 R0 时，`MOV R0,R1` 会覆盖尚未搬走的商 R0 → 需先暂存商
+        const qOverwritesR = (rq === 'R1');   // 搬商会覆盖余
+        const rOverwritesQ = (rr === 'R0');   // 搬余会覆盖商
+        let scr2 = null;
+        if (qOverwritesR || rOverwritesQ) {
+          const busy2 = new Set(['R0', 'R1']);
+          if (rq) busy2.add(rq);
+          if (rr) busy2.add(rr);
+          for (const r of ['R2', 'R3', 'R4', 'R5', 'R6']) { if (!busy2.has(r)) { scr2 = r; break; } }
+        }
+        if (qOverwritesR) {
+          // 暂存余，再搬商（会覆盖R1），最后搬余
+          if (scr2) this.asm(`\tMOV ${scr2}, R1`);
+          if (rq !== 'R0') this.asm(`\tMOV ${rq}, R0`);
+          if (rr && rr !== 'R1') this.asm(`\tMOV ${rr}, ${scr2}`);
+        } else if (rOverwritesQ) {
+          // 暂存商，再搬余（会覆盖R0），最后搬商
+          if (scr2) this.asm(`\tMOV ${scr2}, R0`);
+          if (rr && rr !== 'R1') this.asm(`\tMOV ${rr}, R1`);
+          if (rq && rq !== 'R0') this.asm(`\tMOV ${rq}, ${scr2}`);
+        } else {
+          if (rr && rr !== 'R1') this.asm(`\tMOV ${rr}, R1`);
+          if (rq && rq !== 'R0') this.asm(`\tMOV ${rq}, R0`);
+        }
         break;
       }
       case IR_OP.UMULHI: {
@@ -9972,20 +10594,32 @@ class ThumbCodeGen {
         const busy = new Set([rs, rt, 'R0', 'R1']);
         let scr = 'R3';
         for (const r of ['R3', 'R2', 'R4']) { if (!busy.has(r)) { scr = r; break; } }
-        if (rt === 'R0') {
-          this.asm(`\tMOV ${scr}, R0`);
-        }
-        if (rs === 'R1') {
-          this.asm(`\tMOV R0, R1`);
-        } else if (rs !== 'R0') {
-          this.asm(`\tMOV R0, ${rs}`);
-        }
-        if (rt === 'R0') {
-          this.asm(`\tMOV R1, ${scr}`);
-        } else if (rt !== 'R1') {
-          this.asm(`\tMOV R1, ${rt}`);
+        // 冲突修复：被乘数在分配乘数时被 spill 且与乘数共寄存器时，重载被乘数。
+        if (rs === rt && this.spillSlots.has(inst.a)) {
+          if (rt === 'R0') {
+            this.asm(`\tMOV R1, R0`);
+            this._emitReload('R0', this.spillSlots.get(inst.a));
+          } else {
+            if (rt !== 'R1') this.asm(`\tMOV R1, ${rt}`);
+            this._emitReload('R0', this.spillSlots.get(inst.a));
+          }
+        } else {
+          if (rt === 'R0') {
+            this.asm(`\tMOV ${scr}, R0`);
+          }
+          if (rs === 'R1') {
+            this.asm(`\tMOV R0, R1`);
+          } else if (rs !== 'R0') {
+            this.asm(`\tMOV R0, ${rs}`);
+          }
+          if (rt === 'R0') {
+            this.asm(`\tMOV R1, ${scr}`);
+          } else if (rt !== 'R1') {
+            this.asm(`\tMOV R1, ${rt}`);
+          }
         }
         this.usedRuntime.add('__umulhi32');
+        this._callClobberCallerSaved();
         this.asm(`\tBL __umulhi32`);
         const rd2 = this.allocReg(inst.dst);
         this.asm(`\tMOV ${rd2}, R0`);
@@ -10176,22 +10810,34 @@ class ThumbCodeGen {
         // 4 对齐偏移），不能用立即数访存，需回退到用 scratch R6 合成地址的通用形式。
         const argReg = `R${inst.idx}`;   // R0..R3
         const off = this._mapFrameOffset(inst.offset);
-        if (off >= 0 && off <= 124 && off % 4 === 0) {
-          this.asm(`\tSTR ${argReg}, [R7, #${off}]`);
+        // 按参数大小选择存储宽度（u8→STRB，u16→STRB+STRB，u32→STR），
+        // 避免用 32 位 STR 覆盖相邻参数槽（如 imgh(u8) 存到 frame[8] 时覆盖 frame[9..11]）。
+        // Thumb-1 无 STRH 立即数访存，u16 参数拆两次 STRB（低字节+高字节）实现。
+        const emitStore = (o, suffix, reg) => this.asm(`\tSTR${suffix} ${reg}, [R7, #${o}]`);
+        if (inst.size === 1) {
+          this.asm(`\tSTRB ${argReg}, [R7, #${off}]`);
+        } else if (inst.size === 2) {
+          // u16：低字节在 off，高字节在 off+1（R7 之上正偏移，小端序）
+          this.asm(`\tSTRB ${argReg}, [R7, #${off}]`);
+          this.asm(`\tLSR R6, ${argReg}, #8`);
+          this.asm(`\tSTRB R6, [R7, #${off + 1}]`);
         } else {
-          // 非 4 对齐（char/short 参数槽）或大偏移：用专用 scratch R6 合成地址，
-          // 避免干扰 R0-R3 与寄存器分配器
-          const abs = Math.abs(off);
-          if (abs <= 255) {
-            this.asm('\tMOV R6, R7');
-            if (off > 0) this.asm(`\tADD R6, #${abs}`);
-            else this.asm(`\tSUB R6, #${abs}`);
-            this.asm(`\tSTR ${argReg}, [R6, #0]`);
+          // u32：仅当偏移 4 对齐才可用单条 STR
+          if (off >= 0 && off <= 124 && off % 4 === 0) {
+            this.asm(`\tSTR ${argReg}, [R7, #${off}]`);
           } else {
-            this.emitLoadConst('R6', off);
-            if (off > 0) this.asm('\tADD R6, R7, R6');
-            else this.asm('\tSUB R6, R7, R6');
-            this.asm(`\tSTR ${argReg}, [R6, #0]`);
+            const abs = Math.abs(off);
+            if (abs <= 255) {
+              this.asm('\tMOV R6, R7');
+              if (off > 0) this.asm(`\tADD R6, #${abs}`);
+              else this.asm(`\tSUB R6, #${abs}`);
+              this.asm(`\tSTR ${argReg}, [R6, #0]`);
+            } else {
+              this.emitLoadConst('R6', off);
+              if (off > 0) this.asm('\tADD R6, R7, R6');
+              else this.asm('\tSUB R6, R7, R6');
+              this.asm(`\tSTR ${argReg}, [R6, #0]`);
+            }
           }
         }
         break;
@@ -10201,6 +10847,7 @@ class ThumbCodeGen {
         this._argLiveTemps.clear();
         this._argBusyRegs.clear();
         const fn = inst.fn;
+        this._callClobberCallerSaved();
         if (typeof fn === 'string' && fn.startsWith('%')) {
           // 函数指针
           const r = this.allocReg(fn);
@@ -10216,6 +10863,9 @@ class ThumbCodeGen {
         // 先保存可能存活的 R0/R1 临时量（调用约定：R0-R3 为调用方保存）。
         const sysNum = inst.n || 0;
         const argc = inst.argc || 0;
+        // SWI 同样破坏 caller-saved（R0-R3/R6）：把仍存活的 caller-saved 驻留临时量
+        // 安全化（溢出/摘除），保证调用后重载正确。
+        this._callClobberCallerSaved();
         // 找到 R0/R1 上可能存活的临时，挤到 R4-R7（被调用方/宿主不破坏）
         const liveIn01 = [];
         for (const [temp, reg] of this.regAlloc) {
@@ -10299,6 +10949,9 @@ class ThumbCodeGen {
           this.literalPool = [];
           this.literalToLabel.clear();
         }
+        // 函数结束：退出中段池冲刷计数状态
+        this._inFunc = false;
+        this._funcCodeBytes = 0;
         break;
       }
       case IR_OP.ADJ: {
@@ -10708,6 +11361,13 @@ class ThumbAssembler {
         // Thumb LDR PC 相对：地址 = ((PC+4) & ~3) + imm8*4，PC 为指令地址
         const pcAligned = ((ldrAbs + 4) & ~3);
         const off = (target - pcAligned) / 4;
+        // 越界扫描：Thumb LDR PC 相对的 imm8 范围是 0..255（即 ±1020 字节）。
+        // 若字面量超出该范围，imm8 会被 &0xff 静默截断，导致加载错误地址——
+        // 正是此前大函数 LDR= 加载错误地址、DrawBuff 被赋垃圾值崩溃的根因。
+        // 这里显式校验并抛出可定位错误（含指令地址与目标），杜绝静默越界。
+        if (off < 0 || off > 255) {
+          throw new Error(`[汇编越界] LDR ${'R' + r.rd}, =${r.symbol} 字面量池超出 Thumb PC 相对 ±1020 字节范围：PC相对偏移 ${off} 个字(0x${(target - pcAligned).toString(16)})，指令@0x${ldrAbs.toString(16)}。请增大 codegen 的 POOL_FLUSH_LIMIT 或就近冲刷字面量池`);
+        }
         const imm8 = off & 0xff;
         textBytes[r.addr] = imm8;
         // Thumb LDR PC 相对：01001 Rd imm8，Rd 位于高字节低 3 位（bit8-10）
@@ -11023,6 +11683,9 @@ class ThumbAssembler {
         const m = ops[1].match(/\[([^\],]+)(?:,\s*#(\d+))?\]/);
         const rn = this.reg(m[1]);
         const imm = m[2] ? parseInt(m[2]) : 0;
+        // 越界扫描：LDR 立即数偏移合法范围 0..124（4 对齐）。
+        // 超出时若静默降级为寄存器形式会用基址寄存器名当 Rm，编码成 [Rn,Rn] 错误指令。
+        if (m[2] !== undefined && !(imm >= 0 && imm <= 124 && imm % 4 === 0)) throw new Error(`[汇编越界] LDR ${ops[0]}, [${m[1]}, #${imm}] 立即数偏移超出 Thumb 合法范围 0..124（4 对齐），指令@0x${this.textAddr + this._addr}`);
         if (imm >= 0 && imm <= 124 && imm % 4 === 0) {
           const imm5 = (imm >> 2) & 0x1f;
           // LDR imm: 0110 1 imm5 Rn Rd
@@ -11037,6 +11700,7 @@ class ThumbAssembler {
         const m = ops[1].match(/\[([^\],]+)(?:,\s*#(\d+))?\]/);
         const rn = this.reg(m[1]);
         const imm = m[2] ? parseInt(m[2]) : 0;
+        if (m[2] !== undefined && !(imm >= 0 && imm <= 31)) throw new Error(`[汇编越界] LDRB ${ops[0]}, [${m[1]}, #${imm}] 立即数偏移超出 Thumb 合法范围 0..31，指令@0x${this.textAddr + this._addr}`);
         if (imm >= 0 && imm <= 31) {
           // LDRB imm: 0111 1 imm5 Rn Rd
           // imm5 跨低位字节(位6-7)与高位字节(位8-10)，imm5 的位2-4需进高位字节
@@ -11050,6 +11714,7 @@ class ThumbAssembler {
         const m = ops[1].match(/\[([^\],]+)(?:,\s*#(\d+))?\]/);
         const rn = this.reg(m[1]);
         const imm = m[2] ? parseInt(m[2]) : 0;
+        if (m[2] !== undefined && !(imm >= 0 && imm <= 62 && imm % 2 === 0)) throw new Error(`[汇编越界] LDRH ${ops[0]}, [${m[1]}, #${imm}] 立即数偏移超出 Thumb 合法范围 0..62（2 对齐），指令@0x${this.textAddr + this._addr}`);
         if (imm >= 0 && imm <= 62 && imm % 2 === 0) {
           const imm5 = (imm >> 1) & 0x1f;
           // LDRH imm: 1000 1 imm5 Rn Rd
@@ -11080,6 +11745,7 @@ class ThumbAssembler {
         const m = ops[1].match(/\[([^\],]+)(?:,\s*#(\d+))?\]/);
         const rn = this.reg(m[1]);
         const imm = m[2] ? parseInt(m[2]) : 0;
+        if (m[2] !== undefined && !(imm >= 0 && imm <= 124 && imm % 4 === 0)) throw new Error(`[汇编越界] STR ${ops[0]}, [${m[1]}, #${imm}] 立即数偏移超出 Thumb 合法范围 0..124（4 对齐），指令@0x${this.textAddr + this._addr}`);
         if (imm >= 0 && imm <= 124 && imm % 4 === 0) {
           const imm5 = (imm >> 2) & 0x1f;
           // STR imm: 0110 0 imm5 Rn Rd
@@ -11093,6 +11759,7 @@ class ThumbAssembler {
         const m = ops[1].match(/\[([^\],]+)(?:,\s*#(\d+))?\]/);
         const rn = this.reg(m[1]);
         const imm = m[2] ? parseInt(m[2]) : 0;
+        if (m[2] !== undefined && !(imm >= 0 && imm <= 31)) throw new Error(`[汇编越界] STRB ${ops[0]}, [${m[1]}, #${imm}] 立即数偏移超出 Thumb 合法范围 0..31，指令@0x${this.textAddr + this._addr}`);
         if (imm >= 0 && imm <= 31) {
           // STRB imm: 0111 0 imm5 Rn Rd
           // imm5 跨低位字节(位6-7)与高位字节(位8-10)，imm5 的位2-4需进高位字节
@@ -11106,6 +11773,7 @@ class ThumbAssembler {
         const m = ops[1].match(/\[([^\],]+)(?:,\s*#(\d+))?\]/);
         const rn = this.reg(m[1]);
         const imm = m[2] ? parseInt(m[2]) : 0;
+        if (m[2] !== undefined && !(imm >= 0 && imm <= 62 && imm % 2 === 0)) throw new Error(`[汇编越界] STRH ${ops[0]}, [${m[1]}, #${imm}] 立即数偏移超出 Thumb 合法范围 0..62（2 对齐），指令@0x${this.textAddr + this._addr}`);
         if (imm >= 0 && imm <= 62 && imm % 2 === 0) {
           const imm5 = (imm >> 1) & 0x1f;
           // STRH imm: 1000 0 imm5 Rn Rd
@@ -11128,9 +11796,15 @@ class ThumbAssembler {
         return [(rm << 8) & 0xffff, 0x45]; // CMP high
       }
       case 'b': {
-        const target = this.labels.get(ops[0]) ?? 0;
+        const target = this.labels.get(ops[0]);
+        // 未定义标签检测：悬空引用此前会因 `?? 0` 被静默当作跳到偏移 0，导致
+        // 跳转落入错误地址（如 PR #52 的 switch 无 default 跳进 rodata）。此处显式报错。
+        if (target === undefined) throw new Error(`[汇编越界] 未定义标签 '${ops[0]}'（B 指令 @0x${this.textAddr + this._addr}）`);
         // B: R[PC] += 4 + soff*2, 故 soff = (target - addr - 4)/2
         const offset = (target - this._addr - 4) / 2;
+        // 越界扫描：Thumb B 的 imm11 范围 -1024..1023（半字），即 ±2048 字节。
+        // 超出会因 &0x7ff 被静默截断，跳到错误地址。
+        if (offset < -1024 || offset > 1023) throw new Error(`[汇编越界] B ${ops[0]} 目标超出 ±2048 字节范围：偏移 ${offset} 半字（指令@0x${this.textAddr + this._addr}，目标@0x${this.textAddr + target}）`);
         const imm11 = offset & 0x7ff;
         return [(imm11 & 0xff), 0xE0 | ((imm11 >> 8) & 0x7)];
       }
@@ -11145,13 +11819,17 @@ class ThumbAssembler {
         const imm8 = offset & 0xff;
         // 若目标超出短分支 ±256 字节范围，膨胀为「反向条件 B .Lskip; B target」（4 字节）
         if (target !== undefined && (offset < -128 || offset > 127)) {
-          const skipOff = 2; // 跳过紧随其后的无条件 B（2 字节）
-          const skipImm8 = skipOff & 0xff;
+          // 反向条件 B .Lskip; B target。BNE/BE 等反向条件须跳到紧随其后的
+          // 无条件 B 之后（即 .Lskip），即跳到本指令 +4 处（跳过本指令与 B 各 2 字节）。
+          // Thumb 条件分支目标 = PC + 4 + imm8*2，故 imm8 应为 0（跳到 PC+4=循环体）。
+          const skipImm8 = 0;
           // 反向条件跳转到 B target 之后
           const invCond = invCondMap[op];
           const first = [(skipImm8 & 0xff), 0xD0 | invCond];
           // 无条件 B target：偏移需相对膨胀后第二条指令地址 (this._addr+2)
           const bOff = (target - (this._addr + 2) - 4) / 2;
+          // 越界扫描：膨胀后的无条件 B 同样受 ±2048 字节范围约束
+          if (bOff < -1024 || bOff > 1023) throw new Error(`[汇编越界] ${op.toUpperCase()} ${ops[0]} 膨胀后的 B 超出 ±2048 字节范围：偏移 ${bOff} 半字（指令@0x${this.textAddr + this._addr}，目标@0x${this.textAddr + target}）`);
           const bImm11 = bOff & 0x7ff;
           const second = [(bImm11 & 0xff), 0xE0 | ((bImm11 >> 8) & 0x7)];
           return [...first, ...second];
@@ -11159,9 +11837,12 @@ class ThumbAssembler {
         return [(imm8 & 0xff), 0xD0 | cond];
       }
       case 'bl': {
-        const target = this.labels.get(ops[0]) ?? 0;
+        const target = this.labels.get(ops[0]);
+        if (target === undefined) throw new Error(`[汇编越界] 未定义标签 '${ops[0]}'（BL 指令 @0x${this.textAddr + this._addr}）`);
         // BL 跨两条半字：目标 = start + imm22*2 + 4
         const offset = (target - this._addr - 4) / 2;
+        // 越界扫描：Thumb BL 的 imm22 范围 ±2^21 半字，即 ±16MB。超出会静默截断。
+        if (offset < -2097152 || offset > 2097151) throw new Error(`[汇编越界] BL ${ops[0]} 目标超出 ±16MB 范围：偏移 ${offset} 半字（指令@0x${this.textAddr + this._addr}，目标@0x${this.textAddr + target}）`);
         const imm22 = offset & 0x3fffff;
         const first = 0xF000 | ((imm22 >> 11) & 0x7ff);
         const second = 0xF800 | (imm22 & 0x7ff);
@@ -11248,12 +11929,16 @@ class Linker {
     const withStartup = !!options.withStartup;
     // 中断向量表：{ 槽位号 -> 函数名 }（由 codegen 的 interrupt N 关键字收集）
     const interruptSlots = options.interruptSlots || null;
-    // 向量表大小：取显式 vecCount 与「中断槽最大号+1」的较大者，保证中断槽被纳入表内
-    let vecCount = options.vecCount !== undefined ? options.vecCount : (withStartup ? 2 : 0);
+    // 向量表大小：取显式 vecCount 与「中断槽最大号+1」的较大者，保证中断槽被纳入表内。
+    // 默认至少保留 4 个入口（16B）：[0]栈顶 [1]Reset [2]NMI [3]HardFault。
+    // NMI/HardFault 默认填 `B .` 死循环（weak 语义），用户用 interrupt 2/3 声明则覆盖。
+    let vecCount = options.vecCount !== undefined ? options.vecCount : (withStartup ? 4 : 0);
     if (withStartup && interruptSlots) {
       let maxSlot = -1;
       for (const slot of interruptSlots.keys()) if (slot > maxSlot) maxSlot = slot;
       vecCount = Math.max(vecCount, maxSlot + 1);
+    } else if (withStartup) {
+      vecCount = Math.max(vecCount, 4);
     }
     const dataInitSize = (options.dataInitSize || 0);
     const stackTop = options.stackTop !== undefined ? options.stackTop : (ramAddr + (options.ramSize || 0x8000));
@@ -11808,6 +12493,20 @@ __umod32:
 	MOV R3, R1
 	BL __udiv32
 	MOV R0, R3
+	POP {R4, PC}
+__udivmod32:
+	; 无符号 32x32 同时返回 商(R0) 与 余(R1)：对标 ARM __aeabi_uidivmod
+	; 输入 R0=被除数, R1=除数；输出 R0=商, R1=余数
+	PUSH {R4, LR}
+	CMP R1, #0
+	BEQ __udivmod32_div0
+	BL __udiv32
+	MOV R1, R3
+	; __udiv32 返回后余数在 R3，移到 R1
+	POP {R4, PC}
+__udivmod32_div0:
+	MOV R0, #0
+	MOV R1, #0
 	POP {R4, PC}
 __udiv32:
 	PUSH {R4, R5, LR}
